@@ -1,0 +1,144 @@
+{
+  "id": "h3-vision-promptor-planner-example",
+  "revision": 0,
+  "last_node_id": 4,
+  "last_link_id": 4,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "CLIPLoader",
+      "pos": [40, 60],
+      "size": [320, 100],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        { "name": "CLIP", "type": "CLIP", "links": [1] }
+      ],
+      "properties": { "Node name for S&R": "CLIPLoader" },
+      "widgets_values": ["qwen3_vl_8b_instruct.safetensors", "stable_diffusion"]
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [40, 220],
+      "size": [320, 310],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [2] },
+        { "name": "MASK", "type": "MASK", "links": null }
+      ],
+      "properties": { "Node name for S&R": "LoadImage" },
+      "widgets_values": ["example_reference.png", "image"]
+    },
+    {
+      "id": 3,
+      "type": "H3VisionPromptor",
+      "pos": [430, 60],
+      "size": [460, 560],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        { "name": "clip", "type": "CLIP", "link": 1 },
+        { "name": "image_0", "type": "IMAGE", "link": 2 }
+      ],
+      "outputs": [
+        { "name": "prompt", "type": "STRING", "links": null },
+        { "name": "vision_context", "type": "STRING", "links": null },
+        { "name": "debug", "type": "STRING", "links": null },
+        { "name": "planner_prompt", "type": "STRING", "links": [3] },
+        { "name": "planner_prompt_ru", "type": "STRING", "links": null },
+        { "name": "global_prompt", "type": "STRING", "links": [4] },
+        { "name": "clip_durations", "type": "STRING", "links": null },
+        { "name": "camera_params", "type": "STRING", "links": null },
+        { "name": "reference_images_status", "type": "STRING", "links": null }
+      ],
+      "properties": { "Node name for S&R": "H3VisionPromptor" },
+      "widgets_values": [
+        "<none - use CLIP input>",
+        "A pale woman in a dark ceremonial robe walks toward a temple altar and awakens it with a touch.",
+        "Auto",
+        8.0,
+        true,
+        24.0,
+        "detailed_subject_scene",
+        "",
+        "",
+        0,
+        "randomize",
+        0.7,
+        0.95,
+        64,
+        2048,
+        1,
+        false,
+        true
+      ]
+    },
+    {
+      "id": 4,
+      "type": "MiniMaxH3LongMediaPlanner",
+      "pos": [950, 60],
+      "size": [780, 950],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "global_prompt",
+          "type": "STRING",
+          "widget": { "name": "global_prompt" },
+          "link": 4
+        },
+        {
+          "name": "multiclip_prompt",
+          "type": "STRING",
+          "widget": { "name": "multiclip_prompt" },
+          "link": 3
+        }
+      ],
+      "outputs": [
+        { "name": "clip_plan", "type": "H3_LONGMEDIA_CLIP_PLAN", "links": null },
+        { "name": "clip_count", "type": "INT", "links": null },
+        { "name": "requested_seconds", "type": "FLOAT", "links": null },
+        { "name": "report", "type": "STRING", "links": null }
+      ],
+      "properties": { "Node name for S&R": "MiniMaxH3LongMediaPlanner" },
+      "widgets_values": [
+        "",
+        "",
+        true,
+        "[{\"clip_id\":\"clip-1\",\"name\":\"\",\"prompt\":\"\",\"duration\":8,\"seed\":null},{\"clip_id\":\"clip-2\",\"name\":\"\",\"prompt\":\"\",\"duration\":8,\"seed\":null},{\"clip_id\":\"clip-3\",\"name\":\"\",\"prompt\":\"\",\"duration\":8,\"seed\":null}]",
+        "",
+        ""
+      ],
+      "widgets_values_named": {
+        "global_prompt": "",
+        "multiclip_prompt": "",
+        "multiclip_auto_import": true,
+        "clips_json": "[{\"clip_id\":\"clip-1\",\"name\":\"\",\"prompt\":\"\",\"duration\":8,\"seed\":null},{\"clip_id\":\"clip-2\",\"name\":\"\",\"prompt\":\"\",\"duration\":8,\"seed\":null},{\"clip_id\":\"clip-3\",\"name\":\"\",\"prompt\":\"\",\"duration\":8,\"seed\":null}]",
+        "multiclip_import_request": "",
+        "multiclip_last_import_source": "",
+        "clip_editor": ""
+      }
+    }
+  ],
+  "links": [
+    [1, 1, 0, 3, 0, "CLIP"],
+    [2, 2, 0, 3, 1, "IMAGE"],
+    [3, 3, 3, 4, 1, "STRING"],
+    [4, 3, 5, 4, 0, "STRING"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": { "scale": 1.0, "offset": [0, 0] },
+    "frontend_version": "1.0.0"
+  },
+  "version": 0.4
+}
