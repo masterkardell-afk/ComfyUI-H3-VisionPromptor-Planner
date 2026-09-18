@@ -146,6 +146,18 @@ def build_planner_messages(total_duration, target_clip_duration, clip_count, cli
         f"Write exactly {int(clip_count)} clips (clip_1 .. clip_{int(clip_count)}) and exactly "
         f"{int(clip_count)} camera cards.")
 
+    # Long clips (beyond the standard ~15s range): spell out per-clip narrative
+    # word budgets so the plan's density scales with each clip's duration
+    # instead of the contract's default 50-90-word band.
+    from . import planner_mode
+    if clip_durations and max(float(d) for d in clip_durations) > planner_mode.STANDARD_CLIP_SECONDS:
+        budgets = ", ".join(
+            f"clip_{i + 1} ~{planner_mode.per_clip_word_budget(d)} words"
+            for i, d in enumerate(clip_durations[:int(clip_count)]))
+        user_parts.append(
+            "Per-clip word budgets (long clips — scale each clip's narrative to its duration, "
+            "covering the full action progression from its start to its end): " + budgets + ".")
+
     if int(n_images) > 0:
         user_parts.append(
             f"{int(n_images)} reference picture(s) are attached to this generation; use "

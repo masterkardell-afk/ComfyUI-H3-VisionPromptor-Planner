@@ -239,6 +239,20 @@ def main():
     durs, w = planner_mode.compute_clip_durations(24.0, 4.0, count=2)
     check("durations: explicit count honored", durs == [12.0, 12.0], f"got {durs}")
 
+    # long clip targets (the clip_duration widget, up to 150s)
+    count, w = planner_mode.planned_clip_count(60.0, 30.0)
+    check("count: 60s/30s -> 2", count == 2 and not w, f"got {count}, {w}")
+    durs, w = planner_mode.compute_clip_durations(60.0, 30.0)
+    check("durations: 60s at 30s target -> [30,30]", durs == [30.0, 30.0], f"got {durs}")
+    count, w = planner_mode.planned_clip_count(2400.0, 150.0)
+    check("count: 2400s/150s -> 16, no clamp warning", count == 16 and not w)
+    durs, w = planner_mode.compute_clip_durations(2400.0, 150.0)
+    check("durations: 2400s at 150s target -> 16x150", durs == [150.0] * 16, f"got {durs}")
+    count, w = planner_mode.planned_clip_count(100.0, 150.0)
+    check("count: total below target -> minimum 2 clips", count == 2)
+    durs, _ = planner_mode.compute_clip_durations(100.0, 150.0)
+    check("durations: 100s at 150s target -> [50,50]", durs == [50.0, 50.0], f"got {durs}")
+
     # ---------------- parse_clips ----------------
     clips, w = planner_mode.parse_clips(split.clips_text, 3)
     check("clips: 3 parsed", len(clips) == 3, f"got {len(clips)}")
@@ -408,6 +422,29 @@ def main():
           1024 <= planner_mode.estimate_translate_tokens("one two three") <= 8192)
     check("tokens: translate scales",
           planner_mode.estimate_translate_tokens(" ".join(["w"] * 4000)) == 8192)
+
+    # ---------------- per-clip word budgets (long clips) ----------------
+    b8 = planner_mode.per_clip_word_budget(8.0)
+    b15 = planner_mode.per_clip_word_budget(15.0)
+    b30 = planner_mode.per_clip_word_budget(30.0)
+    b60 = planner_mode.per_clip_word_budget(60.0)
+    b150 = planner_mode.per_clip_word_budget(150.0)
+    check("budget: 8-15s clips stay in the default 50-90 band",
+          50 <= b8 <= 90 and 50 <= b15 <= 90, f"got {b8}, {b15}")
+    check("budget: monotonic with duration",
+          b8 < b30 < b60 < b150, f"got {b8}, {b30}, {b60}, {b150}")
+    check("budget: capped at 250", b150 == 250 and
+          planner_mode.per_clip_word_budget(1000.0) == 250)
+    check("budget: floor at 50", planner_mode.per_clip_word_budget(0.0) == 50
+          and planner_mode.per_clip_word_budget(-5.0) == 50)
+    check("tokens: estimate scales with long durations",
+          planner_mode.estimate_planner_tokens(16, [150.0] * 16)
+          > planner_mode.estimate_planner_tokens(16, [8.0] * 16))
+    check("tokens: 16x150s plan still within the 8192 cap",
+          2048 <= planner_mode.estimate_planner_tokens(16, [150.0] * 16) <= 8192)
+    check("tokens: durations shorter than count padded with the floor",
+          planner_mode.estimate_planner_tokens(4, [30.0])
+          == planner_mode.estimate_planner_tokens(4, [30.0, 30.0, 30.0, 30.0]))
 
     # ---------------- import-safety of a long real-world-shaped plan ----------------
     long_clips = [f"Beat {i}: the subject advances through stage {i} while the "

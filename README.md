@@ -108,9 +108,7 @@ the dropdown on `<none - use CLIP input>`.
 | `user_idea` | string (multiline) | `""` | Your rough idea; may be empty if images carry the concept |
 | `images` | IMAGE ×0–4 (growable) | — | Click *add input* for more sockets (`image_0…image_3`) |
 | `task_type` | combo | `Auto` | Auto: 0 img→T2VA, 1→I2VA, 2→FL2VA, ≥3→Ref2VA. Pick **L2VA** manually for last-frame tasks |
-| `duration` | float | `8.0` | 4.0–15.0 s, drives word budget and timestamp validation. **Planner mode:** target length of ONE clip |
-| `emit_planner_outputs` | bool | `False` | Planner mode switch (mutually exclusive with the original outputs) |
-| `total_duration` | float | `24.0` | Planner mode: total video length, 8–2400 s (`clip_count = ceil(total / target)`, clamped to 2–16 clips) |
+| `duration` | float | `8.0` | 4.0–15.0 s, drives word budget and timestamp validation. **Planner mode:** target length of ONE clip — used when `clip_duration` is 0 (auto) |
 | `vision_mode` | combo | `detailed_subject_scene` | Presets from `prompts/vision_presets.json`, or `skip (idea only)` |
 | `extra_instructions` | string (optional) | `""` | Dialogue lines, mood, camera wishes |
 | `custom_system_prompt` | string (optional, advanced) | `""` | Fully replaces the built-in H3 system prompt |
@@ -121,6 +119,19 @@ the dropdown on `<none - use CLIP input>`.
 | `variants` | int | `1` | 1–4 prompt variants (seeds `seed+i`), separated by `===== VARIANT n =====` |
 | `use_default_template` | bool (advanced) | `False` | Use the model's built-in chat template instead of ours |
 | `keep_model_loaded` | bool (advanced) | `True` | Cache the CLIP between runs |
+| `emit_planner_outputs` | bool (optional) | `False` | Planner mode switch (mutually exclusive with the original outputs) |
+| `total_duration` | float (optional) | `24.0` | Planner mode: total video length, 8–2400 s (`clip_count = ceil(total / target)`, clamped to 2–16 clips) |
+| `clip_duration` | float (optional) | `0.0` | Planner mode: TARGET length of ONE clip, `0` = auto (use `duration`). 0–150 s — lets planner plans target clips **beyond the original node's 15 s single-video cap**, up to LongMedia's 150 s per-clip limit. Overrides `duration` in planner mode; ignored in the original mode |
+
+> **Widget placement (v1.1.1+).** The three planner inputs are deliberately
+> optional and render at the **bottom of the node panel** (after
+> `extra_instructions` / `custom_system_prompt`), not next to `duration`.
+> ComfyUI applies a saved workflow's `widgets_values` **positionally**, so the
+> upstream original's widget order must stay an exact prefix — this keeps
+> workflows saved with the original node loading byte-identically (the planner
+> widgets simply fall back to their defaults). Inserting them in the middle
+> (v1.1.0) shifted `seed`/`temperature`/`top_p`/`max_tokens` onto wrong widgets
+> and produced "Input not in range" errors on load.
 
 **Outputs:** `prompt` (STRING), `vision_context` (STRING), `debug` (STRING
 JSON: clip source, detected task, timings, warnings) — active in the original

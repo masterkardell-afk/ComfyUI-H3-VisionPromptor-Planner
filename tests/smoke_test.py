@@ -213,11 +213,11 @@ def main():
     check("H3VisionPromptor display_name", s1.display_name == "H3 Vision Promptor (Local VLM)")
     check("H3VisionPromptor category", s1.category == "H3/Promptor")
     expected_inputs = ["clip", "text_encoder", "user_idea", "images", "task_type",
-                       "duration", "emit_planner_outputs", "total_duration",
-                       "vision_mode", "extra_instructions",
+                       "duration", "vision_mode", "extra_instructions",
                        "custom_system_prompt", "seed", "temperature", "top_p",
                        "top_k", "max_tokens", "variants", "use_default_template",
-                       "keep_model_loaded"]
+                       "keep_model_loaded", "emit_planner_outputs", "total_duration",
+                       "clip_duration"]
     got_inputs = [i.id for i in s1.inputs]
     check("H3VisionPromptor input order/names", got_inputs == expected_inputs, f"got {got_inputs}")
     check("H3VisionPromptor outputs",
@@ -225,9 +225,53 @@ def main():
                                          "planner_prompt", "planner_prompt_ru",
                                          "global_prompt", "clip_durations",
                                          "camera_params", "reference_images_status"])
-    seed_in = s1.inputs[11]
+    seed_in = s1.inputs[9]
     check("seed control_after_generate=randomize",
           seed_in.kwargs.get("control_after_generate") == "randomize")
+    # Widget-order contract: the original node's widget order must be an exact
+    # prefix (required first, optional after) so old workflows load cleanly.
+    orig_prefix = [i.id for i in s1.inputs[:17]]
+    check("original widget order kept as prefix",
+          orig_prefix == ["clip", "text_encoder", "user_idea", "images", "task_type",
+                          "duration", "vision_mode", "extra_instructions",
+                          "custom_system_prompt", "seed", "temperature", "top_p",
+                          "top_k", "max_tokens", "variants", "use_default_template",
+                          "keep_model_loaded"], f"got {orig_prefix}")
+    emit_in = s1.inputs[17]
+    total_in = s1.inputs[18]
+    clipdur_in = s1.inputs[19]
+    check("emit_planner_outputs optional (renders after optionals)",
+          bool(emit_in.kwargs.get("optional")) is True)
+    check("total_duration optional (renders after optionals)",
+          bool(total_in.kwargs.get("optional")) is True)
+    check("clip_duration optional, max=150 (LongMedia per-clip cap)",
+          bool(clipdur_in.kwargs.get("optional")) is True
+          and clipdur_in.kwargs.get("max") == 150.0
+          and clipdur_in.kwargs.get("default") == 0.0)
+    # Regression (v1.1.1): a workflow saved with the ORIGINAL node stores
+    # widgets_values POSITIONALLY (16 slots). The frontend renders widgets as
+    # required-inputs (list order) followed by optional-inputs (list order),
+    # and the seed widget takes TWO slots (value + control_after_generate).
+    # Simulate that ordering from the fork schema and verify every old slot
+    # would land on the identically-named widget.
+    widget_only = [i for i in s1.inputs if i.id not in ("clip", "images")]
+    req = [i.id for i in widget_only if not i.kwargs.get("optional")]
+    opt = [i.id for i in widget_only if i.kwargs.get("optional")]
+    slots = []
+    for name in req + opt:
+        slots.append(name)
+        if name == "seed":
+            slots.append("<control_after_generate slot>")
+    orig_slots = slots[:-3]  # fork adds emit/total/clip_duration at the tail
+    expect_orig = ["text_encoder", "user_idea", "task_type", "duration", "vision_mode",
+                   "seed", "<control_after_generate slot>", "temperature", "top_p", "top_k",
+                   "max_tokens", "variants", "use_default_template", "keep_model_loaded",
+                   "extra_instructions", "custom_system_prompt"]
+    check("old 16-slot widgets_values lands on same-named widgets",
+          orig_slots == expect_orig, f"got {orig_slots}")
+    check("fork widget slots = original + 3 planner widgets",
+          slots == expect_orig + ["emit_planner_outputs", "total_duration", "clip_duration"],
+          f"got {slots}")
     imgs_in = s1.inputs[3]
     check("images autogrow template prefix image_", imgs_in.template.kwargs.get("prefix") == "image_")
     check("images autogrow min=0 max=4",
@@ -561,6 +605,9 @@ def main():
     check("planner: debug carries plan fields",
           pdebug["clip_count"] == 3 and pdebug["clips_parsed"] == 3
           and pdebug["cameras_validated"] == 3 and pdebug["total_duration"] == 24.0)
+    check("planner: clip_duration=0 falls back to duration widget",
+          pdebug["target_clip_duration"] == 8.0
+          and pdebug["target_clip_duration_source"] == "duration")
     gen_calls = [c for c in fpc.calls if c[0] == "generate"]
     check("planner: exactly two generation passes", len(gen_calls) == 2,
           f"got {len(gen_calls)}")
@@ -568,6 +615,93 @@ def main():
           gen_calls[0][1] >= 2048 and gen_calls[0][1] != 256, f"got {gen_calls[0][1]}")
     check("planner: translate pass uses fidelity temperature",
           abs(gen_calls[1][2] - 0.3) < 1e-9 and gen_calls[1][1] >= 1024)
+
+    # 11b. Planner mode with clip_duration > 15s (long clips beyond the
+    # original node's single-video cap): 60s total at a 30s clip target
+    # must yield exactly 2 clips of 30s each.
+    PLANNER_ANSWER_2 = (
+        "=== GLOBAL ===\n"
+        "A pale woman in a dark ceremonial robe inside an ancient temple.\n"
+        "\n"
+        "=== CLIPS ===\n"
+        "clip_1:\n"
+        "The woman walks toward the central altar across the long ceremonial hall.\n"
+        "\n"
+        "clip_2:\n"
+        "She reaches the altar and the chamber fills with warm light.\n"
+        "\n"
+        "=== CAMERAS ===\n"
+        '[{"clip_id": "clip-1", "clip_name": "Approach", "shot_size": "Medium Shot", '
+        '"rig": "3-Axis Gimbal", "camera_body": "Cinematic Neutral", "lens": "Natural 35mm", '
+        '"stabilization": "Gimbal Smooth", "movement": "Track Forward", "speed": "Slow", '
+        '"transition_type": "Continuous / Same Shot", "space_relation": "Same Space", '
+        '"entity_continuity": "Lock Population / Layout", "transition_to_next": true}, '
+        '{"clip_id": "clip-2", "clip_name": "Arrival", "shot_size": "Wide Shot", '
+        '"rig": "Tripod / Locked Head", "camera_body": "Cinematic Neutral", '
+        '"lens": "Natural 24mm", "stabilization": "Hard Locked", '
+        '"movement": "Locked-Off / Static", "speed": "Static", '
+        '"transition_type": "Cut", "space_relation": "Same Space", '
+        '"entity_continuity": "Lock Population / Layout", "transition_to_next": false}]'
+    )
+    RU_ANSWER_2 = (
+        "GLOBAL:\n"
+        "Бледная женщина в тёмном церемониальном одеянии внутри древнего храма.\n"
+        "\n"
+        "clip_1:\n"
+        "Женщина идёт к центральному алтарю через длинный церемониальный зал.\n"
+        "\n"
+        "clip_2:\n"
+        "Она достигает алтаря, и зал наполняется тёплым светом."
+    )
+
+    class FakePlannerClip2(FakePlannerClip):
+        def __init__(self):
+            super().__init__()
+            self.prompts = []
+
+        def tokenize(self, prompt, image=None, skip_template=False, min_length=1):
+            self.prompts.append(str(prompt))
+            return super().tokenize(prompt, image, skip_template, min_length)
+
+        def decode(self, ids):
+            n_generate = sum(1 for c in self.calls if c[0] == "generate")
+            return PLANNER_ANSWER_2 if n_generate == 1 else RU_ANSWER_2
+
+    fpc2 = FakePlannerClip2()
+    planner_out2 = nodes.H3VisionPromptor.execute(
+        text_encoder="ignored", user_idea="a ritual in a temple", task_type="Auto",
+        duration=8.0, vision_mode="skip (idea only)", seed=7, temperature=0.7,
+        top_p=0.95, top_k=64, max_tokens=256, variants=1,
+        use_default_template=False, keep_model_loaded=True,
+        clip=fpc2, images=None, extra_instructions="", custom_system_prompt="",
+        emit_planner_outputs=True, total_duration=60.0, clip_duration=30.0,
+    )
+    args2 = planner_out2.args if isinstance(planner_out2, _NodeOutput) else planner_out2.result
+    check("planner long clips: 2 clips of 30s",
+          json.loads(args2[6]) == [30.0, 30.0], f"got {args2[6]}")
+    check("planner long clips: planner_prompt has 2 sections",
+          args2[3].count("clip_") == 2 and args2[3].startswith("clip_1:"))
+    check("planner long clips: 2 camera cards",
+          len(json.loads(args2[7])) == 2)
+    pdebug2 = json.loads(args2[2])
+    check("planner long clips: clip_duration overrides duration",
+          pdebug2["target_clip_duration"] == 30.0
+          and pdebug2["target_clip_duration_source"] == "clip_duration"
+          and pdebug2["clip_count"] == 2 and pdebug2["total_duration"] == 60.0)
+    gen2 = [c for c in fpc2.calls if c[0] == "generate"]
+    check("planner long clips: exactly two generation passes", len(gen2) == 2,
+          f"got {len(gen2)}")
+    planner_user_msg = fpc2.prompts[0] if fpc2.prompts else ""
+    check("planner long clips: prompt carries 60s/2x30s constraint",
+          "60 seconds in total" in planner_user_msg and "30s" in planner_user_msg
+          and "2 consecutive clips" in planner_user_msg)
+    budget30 = nodes.planner_mode.per_clip_word_budget(30.0)
+    check("planner long clips: prompt carries per-clip word budgets",
+          f"clip_1 ~{budget30} words" in planner_user_msg
+          and f"clip_2 ~{budget30} words" in planner_user_msg,
+          f"budget30={budget30}")
+    check("planner long clips: token budget scaled with durations",
+          gen2[0][1] >= 2048, f"got {gen2[0][1]}")
 
     # ------------------------------------------------------------------
     # 12. Original mode behavior-identical to the upstream package

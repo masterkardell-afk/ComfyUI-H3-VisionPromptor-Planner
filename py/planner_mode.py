@@ -36,6 +36,19 @@ MAX_CLIP_SECONDS = 150.0
 MIN_TOTAL_SECONDS = 8.0
 MAX_TOTAL_SECONDS = 2400.0
 
+# Per-clip narrative word budget: the generation contract's default is
+# "50-90 words" for a standard ~8-15s clip. Longer clips (the planner target
+# may be up to MAX_CLIP_SECONDS via the clip_duration widget) get a budget
+# that grows sub-linearly with the clip's seconds, clamped to a paragraph-ish
+# maximum (250 words keeps 16x150s plans inside the 8192-token cap).
+WORD_BUDGET_BASE = 45.0
+WORD_BUDGET_PER_SECOND = 1.4
+WORD_BUDGET_MIN = 50
+WORD_BUDGET_MAX = 250
+# Clips at or below this length keep the contract's default "50-90 words"
+# rule; the user message only spells out explicit budgets above it.
+STANDARD_CLIP_SECONDS = 15.5
+
 # Section markers of the generation contract.
 SECTION_NAMES = ("GLOBAL", "CLIPS", "CAMERAS")
 SECTION_MARKER_RE = re.compile(
@@ -582,14 +595,34 @@ def _round_up64(value: int) -> int:
     return int(math.ceil(max(0, value) / 64.0)) * 64
 
 
-def estimate_planner_tokens(clip_count: int) -> int:
+def per_clip_word_budget(clip_seconds: float) -> int:
+    """Narrative word budget for ONE clip body, scaled with its duration.
+
+    45 + 1.4*seconds, clamped to 50..250 words. An 8-15s clip lands inside
+    the contract's default "50-90 words" band; a 60s clip targets ~129 words;
+    a 150s clip is capped at 250 (16 such clips still fit the 8192-token
+    generation budget).
+    """
+    seconds = max(0.0, float(clip_seconds or 0.0))
+    words = WORD_BUDGET_BASE + WORD_BUDGET_PER_SECOND * seconds
+    return int(min(WORD_BUDGET_MAX, max(WORD_BUDGET_MIN, round(words))))
+
+
+def estimate_planner_tokens(clip_count: int, durations=None) -> int:
     """Token budget for the single planner generation pass.
 
-    ~110 tokens per clip body + ~120 tokens per camera card + global +
-    section overhead + safety margin.
+    ~1.5 tokens per word of clip body + ~130 tokens per camera card + global
+    + section overhead + safety margin. With `durations` given, per-clip word
+    budgets scale with each clip's seconds (long clips -> longer bodies);
+    without it, the historical per-clip flat estimate (~260 tokens) applies.
     """
     count = max(1, int(clip_count))
-    estimate = 360 + count * 260
+    if durations:
+        per_clip = [per_clip_word_budget(d) for d in durations[:count]
+                    ] + [WORD_BUDGET_MIN] * max(0, count - len(durations))
+        estimate = 360 + sum(int(w * 1.5) + 130 for w in per_clip)
+    else:
+        estimate = 360 + count * 260
     return int(min(8192, max(2048, _round_up64(estimate))))
 
 

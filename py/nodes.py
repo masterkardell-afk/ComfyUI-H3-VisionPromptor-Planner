@@ -136,18 +136,8 @@ class H3VisionPromptor(io.ComfyNode):
                                        "Pick L2VA explicitly for last-frame tasks."),
                 io.Float.Input("duration", default=8.0, min=4.0, max=15.0, step=0.5,
                                tooltip="Target video length in seconds. In planner mode this is "
-                                       "the TARGET length of one clip."),
-                io.Boolean.Input("emit_planner_outputs", default=False,
-                                 tooltip="Planner mode: emit LongMedia Planner outputs "
-                                         "(planner_prompt, planner_prompt_ru, global_prompt, "
-                                         "clip_durations, camera_params, "
-                                         "reference_images_status) and disable the original "
-                                         "prompt/vision_context outputs. Mutually exclusive "
-                                         "with the original mode."),
-                io.Float.Input("total_duration", default=24.0, min=8.0, max=2400.0, step=1.0,
-                               tooltip="Planner mode only: total video duration in seconds "
-                                       "(clip_count = ceil(total / clip target), clamped to "
-                                       "LongMedia's 2..16 clips)."),
+                                       "the TARGET length of one clip — used when "
+                                       "clip_duration is 0 (auto)."),
                 io.Combo.Input("vision_mode", options=_vision_preset_keys() + [SKIP_VISION],
                                tooltip="How the VLM describes the reference image(s) before writing. "
                                        "'skip (idea only)' writes from the idea alone."),
@@ -169,6 +159,37 @@ class H3VisionPromptor(io.ComfyNode):
                                          "instead of this node's H3-aware template."),
                 io.Boolean.Input("keep_model_loaded", default=True, advanced=True,
                                  tooltip="Cache the text-encoder CLIP between runs (faster, uses VRAM/RAM)."),
+                # --- Planner-mode inputs (fork) --------------------------------
+                # WIDGET-ORDER CONTRACT: ComfyUI renders required widgets first,
+                # then optional ones, and saved workflows apply widgets_values
+                # POSITIONALLY. To keep workflows saved with the upstream
+                # original node loading byte-identically, the original widget
+                # order must stay an exact prefix — so these two inputs MUST be
+                # optional=True and MUST stay at the very END of this list.
+                # (They then render at the bottom of the panel, after
+                # extra_instructions / custom_system_prompt.) Inserting them in
+                # the middle shifts seed/"randomize"/temperature/top_p/max_tokens
+                # onto wrong widgets and triggers "Input not in range" errors.
+                io.Boolean.Input("emit_planner_outputs", default=False, optional=True,
+                                 tooltip="Planner mode: emit LongMedia Planner outputs "
+                                         "(planner_prompt, planner_prompt_ru, global_prompt, "
+                                         "clip_durations, camera_params, "
+                                         "reference_images_status) and disable the original "
+                                         "prompt/vision_context outputs. Mutually exclusive "
+                                         "with the original mode."),
+                io.Float.Input("total_duration", default=24.0, min=8.0, max=2400.0, step=1.0,
+                               optional=True,
+                               tooltip="Planner mode only: total video duration in seconds "
+                                       "(clip_count = ceil(total / clip target), clamped to "
+                                       "LongMedia's 2..16 clips)."),
+                io.Float.Input("clip_duration", default=0.0, min=0.0, max=150.0, step=0.5,
+                               optional=True,
+                               tooltip="Planner mode only: TARGET duration of ONE clip, "
+                                       "0 = auto (use the duration widget). Allows clip "
+                                       "targets beyond the original node's 15s single-video "
+                                       "cap — up to LongMedia's 150s per-clip limit. In "
+                                       "planner mode it overrides 'duration'; in the "
+                                       "original mode it is ignored."),
             ],
             outputs=[
                 io.String.Output("prompt"),
@@ -200,7 +221,7 @@ class H3VisionPromptor(io.ComfyNode):
                 use_default_template, keep_model_loaded,
                 clip=None, images=None, extra_instructions="",
                 custom_system_prompt="", emit_planner_outputs=False,
-                total_duration=24.0) -> io.NodeOutput:
+                total_duration=24.0, clip_duration=0.0) -> io.NodeOutput:
         if emit_planner_outputs:
             return cls._execute_planner(
                 text_encoder=text_encoder, user_idea=user_idea, task_type=task_type,
@@ -211,7 +232,7 @@ class H3VisionPromptor(io.ComfyNode):
                 keep_model_loaded=keep_model_loaded, clip=clip, images=images,
                 extra_instructions=extra_instructions,
                 custom_system_prompt=custom_system_prompt,
-                total_duration=total_duration)
+                total_duration=total_duration, clip_duration=clip_duration)
 
         t_start = time.time()
 
@@ -295,9 +316,23 @@ class H3VisionPromptor(io.ComfyNode):
                          seed, temperature, top_p, top_k, max_tokens, variants,
                          use_default_template, keep_model_loaded, clip, images,
                          extra_instructions, custom_system_prompt,
-                         total_duration) -> io.NodeOutput:
+                         total_duration, clip_duration=0.0) -> io.NodeOutput:
         t_start = time.time()
         warnings: list[str] = []
+
+        # Effective per-clip target: the planner-only clip_duration widget
+        # (0 = auto) overrides the original 4-15s duration widget, so planner
+        # plans may target clips up to LongMedia's 150s per-clip limit.
+        try:
+            clip_duration_val = float(clip_duration or 0.0)
+        except (TypeError, ValueError):
+            clip_duration_val = 0.0
+        if clip_duration_val > 0:
+            target_clip_duration = clip_duration_val
+            target_source = "clip_duration"
+        else:
+            target_clip_duration = float(duration)
+            target_source = "duration"
 
         clip_obj, source_desc = engine.resolve_clip(clip, text_encoder, keep_model_loaded)
         image_tensor = _collect_images(images)
@@ -324,19 +359,19 @@ class H3VisionPromptor(io.ComfyNode):
             vision_seconds = time.time() - t_vis
 
         # --- duration arithmetic (deterministic, not VLM) -----------------
-        clip_count, count_warnings = planner_mode.planned_clip_count(total_duration, duration)
+        clip_count, count_warnings = planner_mode.planned_clip_count(total_duration, target_clip_duration)
         warnings.extend(count_warnings)
         durations, dur_warnings = planner_mode.compute_clip_durations(
-            total_duration, duration, clip_count)
+            total_duration, target_clip_duration, clip_count)
         warnings.extend(dur_warnings)
 
         # --- single planner generation pass ------------------------------
         system, user = prompt_builder.build_planner_messages(
-            total_duration, duration, clip_count, durations,
+            total_duration, target_clip_duration, clip_count, durations,
             user_idea, vision_context, extra_instructions,
             custom_system_prompt, n_images,
         )
-        planner_budget = planner_mode.estimate_planner_tokens(clip_count)
+        planner_budget = planner_mode.estimate_planner_tokens(clip_count, durations)
         t_gen = time.time()
         raw = engine.generate_text(
             clip_obj, system, user,
@@ -411,7 +446,8 @@ class H3VisionPromptor(io.ComfyNode):
             "n_images": n_images,
             "reference_images_status": json.loads(reference_status),
             "total_duration": float(total_duration),
-            "target_clip_duration": float(duration),
+            "target_clip_duration": float(target_clip_duration),
+            "target_clip_duration_source": target_source,
             "clip_count": int(clip_count) if clips else 0,
             "clips_parsed": len(clips),
             "clip_durations": durations,

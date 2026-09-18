@@ -64,11 +64,7 @@
         "A pale woman in a dark ceremonial robe walks toward a temple altar and awakens it with a touch.",
         "Auto",
         8.0,
-        true,
-        24.0,
         "detailed_subject_scene",
-        "",
-        "",
         0,
         "randomize",
         0.7,
@@ -77,8 +73,34 @@
         2048,
         1,
         false,
-        true
-      ]
+        true,
+        "",
+        "",
+        true,
+        24.0,
+        0.0
+      ],
+      "widgets_values_named": {
+        "text_encoder": "<none - use CLIP input>",
+        "user_idea": "A pale woman in a dark ceremonial robe walks toward a temple altar and awakens it with a touch.",
+        "task_type": "Auto",
+        "duration": 8.0,
+        "vision_mode": "detailed_subject_scene",
+        "seed": 0,
+        "control_after_generate": "randomize",
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 64,
+        "max_tokens": 2048,
+        "variants": 1,
+        "use_default_template": false,
+        "keep_model_loaded": true,
+        "extra_instructions": "",
+        "custom_system_prompt": "",
+        "emit_planner_outputs": true,
+        "total_duration": 24.0,
+        "clip_duration": 0.0
+      }
     },
     {
       "id": 4,
