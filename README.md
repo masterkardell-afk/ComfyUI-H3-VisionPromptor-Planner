@@ -188,6 +188,23 @@ script) until Cameras grows a text import.
 
 ## Troubleshooting
 
+- **Empty planner outputs / "dots" instead of a prompt (Qwen3 models)** —
+  Qwen3 models are reasoners: the answer starts with a thinking block, and
+  ComfyUI's own qwen3vl template suppresses it by appending an **empty
+  think block** after the assistant marker. This node pre-formats its prompt
+  with `<|im_start|>` markers, which makes ComfyUI's tokenizer *skip* its
+  template wrapper — and with it the suppressor. The model then burns its
+  whole token budget inside the think block (degenerating into rows of dots
+  on aggressive 4-bit quants), nothing parseable arrives, and
+  `planner_prompt` / `planner_prompt_ru` / `global_prompt` come out empty
+  while `clip_durations` still shows the computed plan. **Fixed in v1.1.3:**
+  all three planner-mode passes (vision / plan / translate) now append the
+  empty think block themselves — byte-identical to what ComfyUI does. If it
+  still degenerates, the quant is at fault: try Q4_K_M/Q5 instead of MRFP4.
+  For diagnosis, connect `debug` to a Previewer — `raw_planner_answer`
+  (first 1600 chars, pre-cleaning) + `raw_planner_answer_chars` show exactly
+  what the model returned, and a loud warning fires when no clip sections
+  parsed.
 - **`[ComfyUI-H3-VisionPromptor] requires a recent ComfyUI …`** — your ComfyUI
   predates the V3 API (`comfy_api.latest`). Update ComfyUI (the native
   *Generate Text* node must exist in your build).

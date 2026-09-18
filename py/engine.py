@@ -138,8 +138,23 @@ def _vision_block(family: str, n_images: int) -> str:
     return ""
 
 
-def build_chat_text(family: str, system: str, user: str, n_images: int, template_override: str | None) -> str:
-    """Build the raw chat-formatted prompt text for the given model family."""
+def build_chat_text(family: str, system: str, user: str, n_images: int, template_override: str | None,
+                     suppress_thinking: bool = False) -> str:
+    """Build the raw chat-formatted prompt text for the given model family.
+
+    ``suppress_thinking`` appends the Qwen3 empty-think-block convention
+    (``<think>\n\n</think>\n\n``) right after the assistant marker for qwen
+    models. This mirrors what ComfyUI's own qwen3vl tokenizer does whenever IT
+    wraps the template (comfy/text_encoders/qwen3vl.py: ``if not thinking:
+    llama_text += "<think>\n\n</think>\n\n"``). Our node always pre-formats
+    the prompt with ``<|im_start|>`` markers, which makes ComfyUI's tokenizer
+    SKIP its own template wrapper (its ``skip_template or
+    text.startswith('<|im_start|>')`` guard) — and therefore also skip the
+    think-suppressor. Without the block, a Qwen3 model spends its token budget
+    inside ``<think>...</think>`` and the visible answer arrives truncated or
+    never. Only the fork's planner-mode passes enable this flag; the legacy
+    path keeps the upstream byte-identical prompt.
+    """
     if template_override:
         images = _vision_block(family, n_images)
         return (
@@ -150,13 +165,16 @@ def build_chat_text(family: str, system: str, user: str, n_images: int, template
         )
 
     if family == "qwen":
-        return (
+        text = (
             f"<|im_start|>system\n{system}<|im_end|>\n"
             f"<|im_start|>user\n"
             + _vision_block(family, n_images)
             + f"{user}<|im_end|>\n"
             f"<|im_start|>assistant\n"
         )
+        if suppress_thinking:
+            text += "<think>\n\n</think>\n\n"
+        return text
     if family == "gemma4":
         # Gemma-4 (comfy/text_encoders/gemma4.py): <|turn> markers, no system
         # role (fold system into the user turn), media block AFTER the text.
@@ -200,12 +218,13 @@ def _strip_echo(decoded: str, prompt: str, family: str) -> str:
 def generate_text(clip, system: str, user: str, image_tensor=None, seed: int = 0, temperature: float = 0.7,
                   top_p: float = 0.95, top_k: int = 64, max_tokens: int = 2048, min_p: float = 0.0,
                   repetition_penalty: float = 1.0, use_default_template: bool = False,
-                  template_override: str | None = None) -> str:
+                  template_override: str | None = None, suppress_thinking: bool = False) -> str:
     """Full chat-format generation using ComfyUI's native CLIP generation stack.
 
     Builds the prompt text via build_chat_text(detect_family(clip), ...), tokenizes
     with image=image_tensor when provided, generates, decodes, strips any echoed
-    prompt prefix, and returns the clean string.
+    prompt prefix, and returns the clean string. ``suppress_thinking`` only
+    affects qwen-family models (see build_chat_text).
     """
     _assert_generatable(clip, "the resolved CLIP")
     family = detect_family(clip)
@@ -215,7 +234,8 @@ def generate_text(clip, system: str, user: str, image_tensor=None, seed: int = 0
             n_images = int(image_tensor.shape[0])
         except Exception:
             n_images = 1
-    prompt = build_chat_text(family, system, user, n_images, template_override)
+    prompt = build_chat_text(family, system, user, n_images, template_override,
+                             suppress_thinking=suppress_thinking)
 
     try:
         tokens = clip.tokenize(prompt, image=image_tensor, skip_template=not use_default_template, min_length=1)

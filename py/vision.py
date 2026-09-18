@@ -45,11 +45,12 @@ def _n_images(image_tensor) -> int:
 
 
 def analyze_images(clip, image_tensor, preset_key: str, custom_prompt: str | None,
-                   seed, temperature, max_tokens) -> str:
+                   seed, temperature, max_tokens, suppress_thinking: bool = False) -> str:
     """Run one batched vision pass over image_tensor and return plain text.
 
     If the batched call raises and there is more than one image, fall back to
-    per-image passes joined as "<Picture N>: ..." lines.
+    per-image passes joined as "<Picture N>: ..." lines. ``suppress_thinking`` is
+    passed through to the engine (qwen-family only; see engine.build_chat_text).
     """
     if image_tensor is None or _n_images(image_tensor) == 0:
         return ""
@@ -74,7 +75,7 @@ def analyze_images(clip, image_tensor, preset_key: str, custom_prompt: str | Non
         return engine.generate_text(
             clip, VISION_SYSTEM_PROMPT, user, image_tensor=image_tensor,
             seed=seed, temperature=temperature, top_p=0.95, top_k=64,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens, suppress_thinking=suppress_thinking,
         ).strip()
     except Exception:
         if n <= 1:
@@ -89,7 +90,7 @@ def analyze_images(clip, image_tensor, preset_key: str, custom_prompt: str | Non
         desc = engine.generate_text(
             clip, VISION_SYSTEM_PROMPT, instruction, image_tensor=single,
             seed=int(seed) + i, temperature=temperature, top_p=0.95, top_k=64,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens, suppress_thinking=suppress_thinking,
         ).strip()
         parts.append(f"<Picture {i + 1}>: {desc}")
     return "\n\n".join(parts)

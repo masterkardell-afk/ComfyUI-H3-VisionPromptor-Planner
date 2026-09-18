@@ -655,9 +655,14 @@ def main():
     )
 
     class FakePlannerClip2(FakePlannerClip):
+        """Qwen-family fake: a tokenizer whose class name sniffs as 'qwen'
+        (engine.detect_family), so the planner pass goes through the qwen chat
+        template + the think suppressor — mirroring the user's Qwen3-VL setup."""
+
         def __init__(self):
             super().__init__()
             self.prompts = []
+            self.tokenizer = type("Qwen3VLTokenizer", (), {})()
 
         def tokenize(self, prompt, image=None, skip_template=False, min_length=1):
             self.prompts.append(str(prompt))
@@ -702,6 +707,76 @@ def main():
           f"budget30={budget30}")
     check("planner long clips: token budget scaled with durations",
           gen2[0][1] >= 2048, f"got {gen2[0][1]}")
+    check("planner long clips: planner pass prompt ends with the Qwen3 empty think block",
+          planner_user_msg.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+          and planner_user_msg.startswith("<|im_start|>system\n"),
+          "suppress_thinking must append the Qwen3 empty-think-block after the assistant marker")
+
+    # ------------------------------------------------------------------
+    # 11c. Degenerate planner answer (the user-reported "пустышка"): the
+    # model burns its budget inside a think block full of dots. The planner
+    # text outputs must be empty BUT debug must now carry the raw answer
+    # excerpt + an explicit warning instead of failing silently.
+    # ------------------------------------------------------------------
+    DEGENERATE_ANSWER = (
+        "<think>\n"
+        + ("................................................................\n" * 24)
+        + "</think>"
+    )
+
+    class FakeDegenerateClip(FakePlannerClip):
+        def decode(self, ids):
+            n_generate = sum(1 for c in self.calls if c[0] == "generate")
+            return DEGENERATE_ANSWER if n_generate == 1 else ""
+
+    fpc3 = FakeDegenerateClip()
+    planner_out3 = nodes.H3VisionPromptor.execute(
+        text_encoder="ignored", user_idea="a ritual in a temple", task_type="Auto",
+        duration=10.0, vision_mode="skip (idea only)", seed=7, temperature=0.4,
+        top_p=0.95, top_k=64, max_tokens=2048, variants=1,
+        use_default_template=True, keep_model_loaded=True,
+        clip=fpc3, images=None, extra_instructions="", custom_system_prompt="",
+        emit_planner_outputs=True, total_duration=60.0, clip_duration=10.0,
+    )
+    args3 = planner_out3.args if isinstance(planner_out3, _NodeOutput) else planner_out3.result
+    check("degenerate: planner text outputs empty",
+          args3[3] == "" and args3[4] == "" and args3[5] == "")
+    check("degenerate: clip_durations still computed",
+          json.loads(args3[6]) == [10.0, 10.0, 10.0, 10.0, 10.0, 10.0], f"got {args3[6]}")
+    check("degenerate: camera_params empty array", args3[7] == "[]")
+    ddebug = json.loads(args3[2])
+    check("degenerate: debug carries raw answer excerpt",
+          ddebug["raw_planner_answer_chars"] == len(DEGENERATE_ANSWER)
+          and ddebug["raw_planner_answer"].startswith("<think>\n")
+          and "...." in ddebug["raw_planner_answer"],
+          "raw_planner_answer must show the un-cleaned model output")
+    check("degenerate: debug flags the parse failure",
+          any("no parseable clip sections" in w for w in ddebug["warnings"]))
+    check("degenerate: debug records template + thinking state",
+          ddebug["use_default_template"] is True
+          and ddebug["thinking_suppressed"] is True)
+    check("degenerate: no translate pass (no clips)",
+          ddebug["translate_token_budget"] == 0
+          and ddebug["raw_translate_answer"] is None)
+
+    # ------------------------------------------------------------------
+    # 11d. Engine template unit checks: the think suppressor is qwen-only
+    # and opt-in (legacy default unchanged).
+    # ------------------------------------------------------------------
+    # engine is already imported from the fork package at the top of main().
+    h3_engine = engine
+    q_base = h3_engine.build_chat_text("qwen", "SYS", "USR", 0, None)
+    q_supp = h3_engine.build_chat_text("qwen", "SYS", "USR", 0, None, suppress_thinking=True)
+    check("engine: default qwen template has NO think block (legacy identical)",
+          q_base.endswith("<|im_start|>assistant\n") and "<think>" not in q_base)
+    check("engine: suppressed qwen template ends with the empty think block",
+          q_supp.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
+    g_supp = h3_engine.build_chat_text("gemma", "SYS", "USR", 0, None, suppress_thinking=True)
+    check("engine: gemma template unaffected by suppress_thinking",
+          "<think>" not in g_supp and g_supp.startswith("<start_of_turn>user\n"))
+    q_img = h3_engine.build_chat_text("qwen", "SYS", "USR", 2, None, suppress_thinking=True)
+    check("engine: vision block preserved with suppression",
+          q_img.count("<|image_pad|>") == 2 and q_img.endswith("<think>\n\n</think>\n\n"))
 
     # ------------------------------------------------------------------
     # 12. Original mode behavior-identical to the upstream package

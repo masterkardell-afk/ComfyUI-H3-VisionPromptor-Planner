@@ -343,7 +343,9 @@ class H3VisionPromptor(io.ComfyNode):
             warnings.append(f"variants={int(variants)} ignored in planner mode (forced to 1; "
                             "multiple variants would break the Planner import format)")
 
-        # --- vision pass (identical to the original mode) ----------------
+        # --- vision pass (same stack as the original mode + thinking
+        # suppression for qwen models — a Qwen3 vision pass left in thinking
+        # mode burns its tokens before writing a single description line) ----
         vision_context = ""
         vision_seconds = 0.0
         if image_tensor is not None and vision_mode != SKIP_VISION:
@@ -352,6 +354,7 @@ class H3VisionPromptor(io.ComfyNode):
                 vision_context = vision.analyze_images(
                     clip_obj, image_tensor, vision_mode, None,
                     seed=seed, temperature=temperature, max_tokens=max_tokens,
+                    suppress_thinking=True,
                 )
             except Exception as e:
                 warnings.append(f"vision pass failed, continuing without it: {e}")
@@ -382,6 +385,7 @@ class H3VisionPromptor(io.ComfyNode):
             top_k=top_k,
             max_tokens=planner_budget,
             use_default_template=use_default_template,
+            suppress_thinking=True,
         )
         planner_seconds = time.time() - t_gen
 
@@ -402,6 +406,13 @@ class H3VisionPromptor(io.ComfyNode):
         global_prompt = split.global_text
         if not split.has_global:
             global_prompt = ""
+        if not clips:
+            warnings.append(
+                "planner answer yielded no parseable clip sections — "
+                "planner_prompt / planner_prompt_ru / global_prompt are empty; "
+                "inspect raw_planner_answer in this debug output to see what the "
+                "model actually returned"
+            )
 
         cards, cam_warnings = planner_mode.parse_cameras(
             split.cameras_text, len(clips) if clips else clip_count)
@@ -412,6 +423,7 @@ class H3VisionPromptor(io.ComfyNode):
         planner_prompt_ru = ""
         translate_seconds = 0.0
         translate_budget = 0
+        raw_ru = ""
         if clips:
             t_tr = time.time()
             try:
@@ -428,6 +440,7 @@ class H3VisionPromptor(io.ComfyNode):
                     top_k=top_k,
                     max_tokens=translate_budget,
                     use_default_template=use_default_template,
+                    suppress_thinking=True,
                 )
                 planner_prompt_ru, tr_warnings = planner_mode.parse_translated(raw_ru)
                 warnings.extend(tr_warnings)
@@ -455,6 +468,14 @@ class H3VisionPromptor(io.ComfyNode):
             "camera_vocab": camera_knowledge.enum_sizes(),
             "planner_token_budget": planner_budget,
             "translate_token_budget": translate_budget,
+            "use_default_template": bool(use_default_template),
+            "thinking_suppressed": True,
+            # Raw model answers (BEFORE light_clean strips think-blocks), so a
+            # degenerate generation is diagnosable from a Previewer on `debug`
+            # instead of guessing from empty planner outputs.
+            "raw_planner_answer": str(raw)[:1600],
+            "raw_planner_answer_chars": len(str(raw)),
+            "raw_translate_answer": (str(raw_ru)[:1600] if raw_ru else None),
             "vision_seconds": round(vision_seconds, 2),
             "planner_seconds": round(planner_seconds, 2),
             "translate_seconds": round(translate_seconds, 2),
