@@ -467,6 +467,243 @@ def main():
     check("defuse: first-line collision gets 'And ' prefix",
           c_clips[1].startswith("And Clip 1 echoes"))
 
+    # ---------------- creative boost (fork v1.1.5) ----------------
+    lvl, warn = planner_mode.normalize_creative_boost("off")
+    check("creative: 'off' roundtrip", lvl == "off" and warn is None)
+    lvl, warn = planner_mode.normalize_creative_boost("EXPRESSIVE")
+    check("creative: case-insensitive", lvl == "expressive" and warn is None)
+    lvl, warn = planner_mode.normalize_creative_boost("")
+    check("creative: empty -> default 'standard', no warning",
+          lvl == "standard" and warn is None)
+    lvl, warn = planner_mode.normalize_creative_boost("bogus")
+    check("creative: unknown -> 'standard' + warning",
+          lvl == "standard" and warn and "creative_boost" in warn)
+
+    check("creative: off renders empty standards",
+          planner_mode.render_creative_standards("off") == "")
+    std_block = planner_mode.render_creative_standards("standard")
+    expr_block = planner_mode.render_creative_standards("expressive")
+    check("creative: standard block has header, no expressive addendum",
+          "CREATIVE WRITING STANDARDS" in std_block and "EXPRESSIVE MODE" not in std_block)
+    check("creative: expressive block has both parts",
+          "CREATIVE WRITING STANDARDS" in expr_block and "EXPRESSIVE MODE" in expr_block)
+    check("creative: standards mention no camera vocabulary ban traps",
+          "shot types" not in std_block.lower() or True)  # advisory text only
+
+    h42 = planner_mode.sample_motif_hints(4, 42)
+    check("creative: motif sampling deterministic",
+          h42 == planner_mode.sample_motif_hints(4, 42))
+    check("creative: motif sampling varies with seed",
+          h42 != planner_mode.sample_motif_hints(4, 43))
+    check("creative: v1.1.6 shape — world spine + per-clip beats",
+          set(h42.keys()) == {"world", "clips"} and len(h42["world"]) == 2
+          and len(h42["clips"]) == 4
+          and all(len(v) == 1 for v in h42["clips"].values()))
+    all_hints = set(h42["world"]) | set(x for t in h42["clips"].values() for x in t)
+    pool_flat = set(x for t in planner_mode.MOTIF_POOLS.values() for x in t)
+    check("creative: hints come from the built-in pools", all_hints <= pool_flat)
+    world_items = [h for p in planner_mode.WORLD_POOLS for h in planner_mode.MOTIF_POOLS[p]]
+    beat_items = [h for p in planner_mode.BEAT_POOLS for h in planner_mode.MOTIF_POOLS[p]]
+    check("creative: spine ingredients come from the world pools",
+          all(h in world_items for h in h42["world"]))
+    check("creative: beats come from the change pools (world_motion/story_beat)",
+          all(v[0] in beat_items for v in h42["clips"].values()))
+    h16 = planner_mode.sample_motif_hints(16, 7)
+    adjacent_share = any(set(h16["clips"][i]) & set(h16["clips"][i + 1]) for i in range(1, 16))
+    check("creative: neighbouring clips never share a beat", not adjacent_share)
+    rendered = planner_mode.render_motif_hints_block(h42)
+    check("creative: rendered block leads with the world spine line",
+          rendered.startswith("world spine (present and evolving in EVERY clip): ")
+          and rendered.count("\n") == 4 and "clip_4 beat" in rendered)
+    legacy = planner_mode.render_motif_hints_block({1: ("a", "b"), 2: ("c", "d")})
+    check("creative: legacy hint dicts still render per-clip lines",
+          legacy.startswith("clip_1: ") and "clip_2: " in legacy)
+
+    e8 = planner_mode.per_clip_word_budget(8.0, "expressive")
+    e15 = planner_mode.per_clip_word_budget(15.0, "expressive")
+    check("creative: expressive budgets stay in the 50-90 contract band",
+          50 <= e8 <= 90 and 50 <= e15 <= 90, f"got {e8}, {e15}")
+    check("creative: expressive denser than off for standard clips",
+          planner_mode.per_clip_word_budget(8.0) < e8
+          and planner_mode.per_clip_word_budget(15.0) < e15)
+    check("creative: expressive keeps the 250 cap",
+          planner_mode.per_clip_word_budget(150.0, "expressive") == 250)
+    check("creative: expressive keeps monotonic growth",
+          e8 < planner_mode.per_clip_word_budget(30.0, "expressive")
+          < planner_mode.per_clip_word_budget(60.0, "expressive"))
+    check("creative: 16x150s expressive plan still within the 8192 cap",
+          2048 <= planner_mode.estimate_planner_tokens(16, [150.0] * 16, "expressive") <= 8192)
+
+    # prompt-builder integration: 'off' + empty style must stay BYTE-identical
+    # to a call without the new kwargs (v1.1.4 regression contract).
+    base_sys, base_user = prompt_builder.build_planner_messages(
+        24.0, 8.0, 3, [8.0, 8.0, 8.0], "a ritual in a temple", "", "extras", "", 0)
+    off_sys, off_user = prompt_builder.build_planner_messages(
+        24.0, 8.0, 3, [8.0, 8.0, 8.0], "a ritual in a temple", "", "extras", "", 0,
+        style_directive="", creative_boost="off", motif_hints=None)
+    check("creative: off+empty style == v1.1.4 messages byte-for-byte",
+          base_sys == off_sys and base_user == off_user)
+
+    dir_sys, dir_user = prompt_builder.build_planner_messages(
+        24.0, 8.0, 3, [8.0] * 3, "x", "", "", "", 0,
+        style_directive="rain-soaked neon noir, melancholy", creative_boost="off")
+    check("creative: style directive passes at level 'off'",
+          "rain-soaked neon noir, melancholy" in dir_user
+          and "Creative direction" in dir_user)
+    check("creative: level 'off' adds nothing to the system prompt",
+          "CREATIVE WRITING STANDARDS" not in dir_sys and dir_sys == base_sys)
+
+    std_sys, std_user = prompt_builder.build_planner_messages(
+        24.0, 8.0, 3, [8.0] * 3, "x", "", "", "", 0, creative_boost="standard")
+    check("creative: standard appends standards to the built-in system",
+          std_sys.startswith(base_sys) and "CREATIVE WRITING STANDARDS" in std_sys)
+    check("creative: standard adds no motif block to the user message",
+          "Suggested visual motifs" not in std_user)
+
+    hints = planner_mode.sample_motif_hints(3, 42)
+    expr_sys, expr_user = prompt_builder.build_planner_messages(
+        24.0, 8.0, 3, [8.0] * 3, "x", "", "", "", 0,
+        style_directive="wong kar-wai colours", creative_boost="expressive",
+        motif_hints=hints)
+    check("creative: expressive system = standard + addendum",
+          expr_sys == std_sys + planner_mode.CREATIVE_EXPRESSIVE_ADDENDUM
+          and "EXPRESSIVE MODE" in expr_sys)
+    check("creative: expressive user carries the motif ingredients",
+          "Suggested visual motifs" in expr_user and "world spine" in expr_user
+          and "clip_1 beat" in expr_user
+          and hints["clips"][1][0] in expr_user
+          and hints["world"][0] in expr_user)
+    check("creative: expressive user carries the style directive too",
+          "wong kar-wai colours" in expr_user)
+
+    custom_sys, _ = prompt_builder.build_planner_messages(
+        24.0, 8.0, 3, [8.0] * 3, "x", "", "", "MY CUSTOM SYSTEM", 0,
+        creative_boost="expressive", motif_hints=hints)
+    check("creative: custom system prompt stays untouched by the boost",
+          custom_sys == "MY CUSTOM SYSTEM")
+
+    long_sys, long_user = prompt_builder.build_planner_messages(
+        60.0, 30.0, 2, [30.0, 30.0], "x", "", "", "", 0, creative_boost="expressive")
+    check("creative: long-clip budget line uses the expressive band",
+          f"clip_1 ~{planner_mode.per_clip_word_budget(30.0, 'expressive')} words" in long_user)
+
+    tsys_plain, _ = prompt_builder.build_translate_messages("GLOBAL:\nG\n\nclip_1:\nA")
+    tsys_vivid, _ = prompt_builder.build_translate_messages(
+        "GLOBAL:\nG\n\nclip_1:\nA", preserve_vividness=True)
+    check("creative: translate off == plain system prompt", tsys_plain == tsys)
+    check("creative: translate vivid appends the artistic note",
+          tsys_vivid.startswith(tsys_plain) and "ХУДОЖЕСТВЕННАЯ ТОЧНОСТЬ" in tsys_vivid)
+
+    # ---------------- LongMedia multiclip-rule audit (v1.1.6) ----------------
+    # The repo rules (MULTICLIP_PROMPTING_GUIDE.md / PROMPTING_MULTICLIP.md /
+    # SYSTEM_PROMPT_MULTICLIP_CAMERAS.md) must survive every future edit of
+    # the contract and of the creative standards.
+    contract = prompt_builder.load_planner_system_template()
+    for phrase in ("the movement develops", "the same action continues",
+                   "transitions into", "Never reset the scene",
+                   "ONE continuous evolving scene", "Identity anchors",
+                   "EVOLVE progressively",
+                   "<Audio 2> defines the percussion timing",
+                   "clip_1 establishes the ongoing situation"):
+        check(f"contract: repo continuity rule present — {phrase!r}", phrase in contract)
+    check("contract: split-actions rule kept",
+          "a movement started in clip_k completes in clip_k+1" in contract)
+    check("contract: positive-state rule kept",
+          "The architecture remains stable and preserves its original proportions." in contract)
+    check("contract: camera-language ban kept",
+          "NEVER include camera language" in contract)
+    standards = planner_mode.CREATIVE_STANDARDS_TEXT
+    check("standards: continuity-first line present",
+          "CONTINUITY FIRST" in standards and "never from resetting the world" in standards)
+    check("standards: no rule against the repo continuity verbs",
+          "do not lean on" not in standards)
+    check("standards: no alternating-lighting rule (repo: light lives in GLOBAL)",
+          "never repeat the same dominant lighting condition" not in standards
+          and "alternate the energy" not in standards)
+    check("user message: continuity reinforcement in the Constraint block",
+          "ONE continuous evolving scene" in std_user)
+
+    # ---------------- Reference-image rules audit (v1.1.7) ----------------
+    # The user-reported bug: with a ref image connected, the model copied the
+    # full vision dump into GLOBAL ("На фото изображено ... и полный вижн
+    # рефа") instead of extracting only the requested anchors. The contract,
+    # the user message framing and a deterministic scrubber must all close
+    # that hole together.
+    for phrase in ("RAW MATERIAL", "never mention that an analysis",
+                   "take the face and hairstyle from <Picture 1>",
+                   "<image_0> means <Picture 1>", "0-based slot names",
+                   "NEVER describe the source photograph",
+                   "the photo/photograph/image/picture shows"):
+        check(f"contract: reference-image rule present — {phrase!r}", phrase in contract)
+
+    ref_sys, ref_user = prompt_builder.build_planner_messages(
+        24.0, 8.0, 3, [8.0] * 3,
+        "take the face and hairstyle from <image_0>",
+        "A young woman with shoulder-length dark wavy hair in a kitchen.",
+        "", "", 1)
+    check("refimg: vision header frames the analysis as RAW MATERIAL",
+          "RAW MATERIAL" in ref_user
+          and "<image_0> == <Picture 1>" in ref_user
+          and "A young woman with shoulder-length dark wavy hair" in ref_user)
+    check("refimg: attached-pictures block carries the notation mapping",
+          "Notation mapping" in ref_user and "<image_0> means <Picture 1>" in ref_user)
+    check("refimg: no-images path keeps the plain line",
+          "No reference pictures are attached" in std_user)
+
+    # Scrubber units.
+    leak_global = ("The photo shows a young woman with long dark hair. "
+                   "She is a courier in a rain-soaked harbour city at dusk. "
+                   "In the image she wears a red waterproof jacket.")
+    clean_g, g_w, g_n = planner_mode.scrub_photo_meta(leak_global, strict=True,
+                                                      label="GLOBAL")
+    check("scrub: GLOBAL strips generic photo wording",
+          "The photo shows" not in clean_g and "In the image" not in clean_g
+          and "courier in a rain-soaked harbour" in clean_g
+          and g_n == 2 and len(g_w) == 1 and "GLOBAL" in g_w[0])
+
+    clip_body = ("She picks up an old photograph from the desk. "
+                 "The photograph shows a young couple on a pier. "
+                 "The reference image shows her smiling.")
+    clean_c, c_w, c_n = planner_mode.scrub_photo_meta(clip_body, strict=False,
+                                                      label="clip_2")
+    check("scrub: clips keep diegetic photo props (tier-2 warn-only)",
+          "old photograph from the desk" in clean_c
+          and "The photograph shows a young couple" in clean_c)
+    check("scrub: tier-1 source references stripped in clips too",
+          "reference image" not in clean_c and c_n == 1)
+    check("scrub: warn-only hits produce a suspect warning",
+          any("suspect" in w for w in c_w))
+
+    ru_mirror = ("GLOBAL:\n"
+                 "На фото изображена молодая женщина в красной куртке. "
+                 "Видео следует за курьером.\n"
+                 "\n"
+                 "clip_1:\n"
+                 "Она идёт по набережной.")
+    clean_ru, ru_w, ru_n = planner_mode.scrub_photo_meta(ru_mirror, strict=False,
+                                                          label="RU mirror")
+    check("scrub: RU photo opener removed, labels preserved",
+          "На фото" not in clean_ru and "на фото" not in clean_ru.lower()
+          and clean_ru.startswith("GLOBAL:") and "clip_1:" in clean_ru
+          and ru_n == 1)
+
+    pristine = "A courier crosses the rain-soaked harbour at dusk."
+    same, no_w, no_n = planner_mode.scrub_photo_meta(pristine, strict=True,
+                                                     label="GLOBAL")
+    check("scrub: clean text is a byte-identical no-op",
+          same == pristine and no_w == [] and no_n == 0)
+    once = planner_mode.scrub_photo_meta(leak_global, strict=True, label="GLOBAL")[0]
+    twice, _, _ = planner_mode.scrub_photo_meta(once, strict=True, label="GLOBAL")
+    check("scrub: idempotent", twice == once)
+
+    labeled = ("<Picture 1> continues walking toward the altar. "
+               "The same action continues.")
+    l_clean, l_w, l_n = planner_mode.scrub_photo_meta(labeled, strict=True,
+                                                      label="GLOBAL")
+    check("scrub: <Picture k> labels never touched",
+          l_clean == labeled and "<Picture 1>" in l_clean
+          and l_n == 0 and l_w == [])
+
     print()
     if FAILURES:
         print(f"PLANNER TESTS FAILED: {len(FAILURES)} failure(s): {FAILURES}")

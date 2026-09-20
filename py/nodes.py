@@ -190,6 +190,23 @@ class H3VisionPromptor(io.ComfyNode):
                                        "cap — up to LongMedia's 150s per-clip limit. In "
                                        "planner mode it overrides 'duration'; in the "
                                        "original mode it is ignored."),
+                io.Combo.Input("creative_boost",
+                               options=list(planner_mode.CREATIVE_LEVELS),
+                               default=planner_mode.CREATIVE_LEVEL_DEFAULT, optional=True,
+                               tooltip="Planner mode only (v1.1.5): creative writing boost. "
+                                       "'off' = byte-identical v1.1.4 prompts; 'standard' = "
+                                       "vividness standards in the system prompt; "
+                                       "'expressive' = standard + per-clip visual motif "
+                                       "ingredients + denser word budgets. In the original "
+                                       "mode it is ignored."),
+                io.String.Input("style_directive", multiline=True, default="", optional=True,
+                                placeholder="Planner mode only: your creative brief — genre, "
+                                            "mood, visual style, references...",
+                                tooltip="Planner mode only (v1.1.5): the author's brief — "
+                                        "genre / mood / visual style / references, passed "
+                                        "verbatim to the planner pass at any creative_boost "
+                                        "level. Example: 'rain-soaked neon noir, melancholy, "
+                                        "Wong Kar-wai colors'."),
             ],
             outputs=[
                 io.String.Output("prompt"),
@@ -221,7 +238,9 @@ class H3VisionPromptor(io.ComfyNode):
                 use_default_template, keep_model_loaded,
                 clip=None, images=None, extra_instructions="",
                 custom_system_prompt="", emit_planner_outputs=False,
-                total_duration=24.0, clip_duration=0.0) -> io.NodeOutput:
+                total_duration=24.0, clip_duration=0.0,
+                creative_boost=planner_mode.CREATIVE_LEVEL_DEFAULT,
+                style_directive="") -> io.NodeOutput:
         if emit_planner_outputs:
             return cls._execute_planner(
                 text_encoder=text_encoder, user_idea=user_idea, task_type=task_type,
@@ -232,7 +251,8 @@ class H3VisionPromptor(io.ComfyNode):
                 keep_model_loaded=keep_model_loaded, clip=clip, images=images,
                 extra_instructions=extra_instructions,
                 custom_system_prompt=custom_system_prompt,
-                total_duration=total_duration, clip_duration=clip_duration)
+                total_duration=total_duration, clip_duration=clip_duration,
+                creative_boost=creative_boost, style_directive=style_directive)
 
         t_start = time.time()
 
@@ -316,9 +336,19 @@ class H3VisionPromptor(io.ComfyNode):
                          seed, temperature, top_p, top_k, max_tokens, variants,
                          use_default_template, keep_model_loaded, clip, images,
                          extra_instructions, custom_system_prompt,
-                         total_duration, clip_duration=0.0) -> io.NodeOutput:
+                         total_duration, clip_duration=0.0,
+                         creative_boost=planner_mode.CREATIVE_LEVEL_DEFAULT,
+                         style_directive="") -> io.NodeOutput:
         t_start = time.time()
         warnings: list[str] = []
+
+        # Creative boost level (v1.1.5): normalize early — an unknown combo
+        # value must degrade to 'standard' with a warning, never crash the
+        # planner pipeline.
+        level, level_warning = planner_mode.normalize_creative_boost(creative_boost)
+        if level_warning:
+            warnings.append(level_warning)
+        style_directive = str(style_directive or "")
 
         # Effective per-clip target: the planner-only clip_duration widget
         # (0 = auto) overrides the original 4-15s duration widget, so planner
@@ -381,12 +411,20 @@ class H3VisionPromptor(io.ComfyNode):
         warnings.extend(dur_warnings)
 
         # --- single planner generation pass ------------------------------
+        # Expressive level: per-clip motif ingredients, sampled
+        # deterministically from the generation seed (same seed -> same
+        # ingredients; new seed -> a new creative direction).
+        motif_hints = (planner_mode.sample_motif_hints(clip_count, int(seed))
+                       if level == "expressive" else None)
         system, user = prompt_builder.build_planner_messages(
             total_duration, target_clip_duration, clip_count, durations,
             user_idea, vision_context, extra_instructions,
             custom_system_prompt, n_images,
+            style_directive=style_directive, creative_boost=level,
+            motif_hints=motif_hints,
         )
-        planner_budget = planner_mode.estimate_planner_tokens(clip_count, durations)
+        planner_budget = planner_mode.estimate_planner_tokens(
+            clip_count, durations, creative_boost=level)
         t_gen = time.time()
         raw = engine.generate_text(
             clip_obj, system, user,
@@ -414,16 +452,57 @@ class H3VisionPromptor(io.ComfyNode):
                 total_duration, total_duration / len(clips), len(clips))[0]
             clip_count = len(clips)
 
+        # --- photo-meta leak scrub (v1.1.7) --------------------------------
+        # The contract forbids describing the source photograph, but a small
+        # instruct-VLM can still copy the reference-image analysis into the
+        # plan ("The photo shows ..." -> RU mirror "На фото изображено ...").
+        # Deterministic backstop: tier-1 (explicit source references) is
+        # stripped everywhere; tier-2 (generic photo wording) is stripped
+        # only from GLOBAL — inside clips a photograph may be a diegetic
+        # prop, so there it only warns. Clean plans pass through untouched.
+        photo_meta_removed = 0
+        if clips:
+            scrubbed_clips = []
+            for i, body in enumerate(clips, start=1):
+                clean, scrub_w, scrub_n = planner_mode.scrub_photo_meta(
+                    body, strict=False, label=f"clip_{i}")
+                if body.strip() and not clean.strip():
+                    warnings.append(
+                        f"photo-meta scrub emptied clip_{i} (v1.1.7) — the whole clip "
+                        "was photo-description; re-seed the node or write a richer idea")
+                scrubbed_clips.append(clean)
+                warnings.extend(scrub_w)
+                photo_meta_removed += scrub_n
+            clips = scrubbed_clips
+
         planner_prompt = planner_mode.assemble_planner_prompt(clips) if clips else ""
         global_prompt = split.global_text
         if not split.has_global:
             global_prompt = ""
+        elif global_prompt.strip():
+            global_prompt, g_scrub_w, g_scrub_n = planner_mode.scrub_photo_meta(
+                global_prompt, strict=True, label="GLOBAL")
+            warnings.extend(g_scrub_w)
+            photo_meta_removed += g_scrub_n
         if not clips:
             warnings.append(
                 "planner answer yielded no parseable clip sections — "
                 "planner_prompt / planner_prompt_ru / global_prompt are empty; "
                 "inspect raw_planner_answer in this debug output to see what the "
                 "model actually returned"
+            )
+        elif not global_prompt.strip():
+            # LongMedia joins global_prompt with EVERY clip prompt at runtime
+            # (_v043_join_global_local_prompt); an empty global means the
+            # constants (identity / environment / style) never reach the
+            # Planner and the clips render as independent scenes (v1.1.6).
+            warnings.append(
+                "GLOBAL section is missing or empty — scene constants (subject "
+                "identity, environment, style) will NOT reach the LongMedia "
+                "Planner, and clip prompts alone read as independent scenes. "
+                "Inspect raw_planner_answer in this debug output, retry with a "
+                "different seed, and make sure global_prompt is wired to the "
+                "Planner's global_prompt input."
             )
 
         cards, cam_warnings = planner_mode.parse_cameras(
@@ -440,7 +519,8 @@ class H3VisionPromptor(io.ComfyNode):
             t_tr = time.time()
             try:
                 tsys, tuser = prompt_builder.build_translate_messages(
-                    planner_mode.translate_source(global_prompt, clips))
+                    planner_mode.translate_source(global_prompt, clips),
+                    preserve_vividness=(level != "off"))
                 translate_budget = planner_mode.estimate_translate_tokens(
                     planner_mode.translate_source(global_prompt, clips))
                 raw_ru = engine.generate_text(
@@ -456,6 +536,15 @@ class H3VisionPromptor(io.ComfyNode):
                 )
                 planner_prompt_ru, tr_warnings = planner_mode.parse_translated(raw_ru)
                 warnings.extend(tr_warnings)
+                # RU-mirror backstop (v1.1.7): the translator only mirrors
+                # the (already scrubbed) EN text, but scrub tier-1 anyway so
+                # a stray "На фото изображено ..." can never reach the reader.
+                ru_clean, ru_w, ru_n = planner_mode.scrub_photo_meta(
+                    planner_prompt_ru, strict=False, label="RU mirror")
+                if ru_w or ru_n:
+                    planner_prompt_ru = ru_clean
+                    warnings.extend(ru_w)
+                    photo_meta_removed += ru_n
             except Exception as e:
                 warnings.append(f"translation pass failed: {e}")
                 print(f"[H3 VisionPromptor] Translation pass failed: {e}")
@@ -473,6 +562,18 @@ class H3VisionPromptor(io.ComfyNode):
             "total_duration": float(total_duration),
             "target_clip_duration": float(target_clip_duration),
             "target_clip_duration_source": target_source,
+            # Creative boost (v1.1.5): what was actually injected after
+            # normalization (the widget value is echoed in the warning above
+            # when it was unknown).
+            "creative_boost": level,
+            "style_directive": (style_directive.strip()[:240] or None),
+            "motif_hints": ({"world": list(motif_hints.get("world") or ()),
+                             "clips": {str(k): list(v) for k, v in (motif_hints.get("clips") or {}).items()}}
+                            if motif_hints else None),
+            "global_prompt_chars": len(global_prompt),
+            # Photo-meta scrubber (v1.1.7): how many leaked photo-description
+            # sentences were removed from GLOBAL / clips / the RU mirror.
+            "photo_meta_scrubbed": photo_meta_removed,
             "clip_count": int(clip_count) if clips else 0,
             "clips_parsed": len(clips),
             "clip_durations": durations,

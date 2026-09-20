@@ -17,15 +17,28 @@ ComfyUI. Responsibilities:
     YAML-ish prompt: wrappers, numbered lists).
   - parse_cameras(): JSON camera cards validated against camera_knowledge.
   - reference_images_status(): machine-readable marker of connected images.
+  - scrub_photo_meta() (v1.1.7): photo-description leak scrubber — when a
+    small instruct-VLM copies the reference-image analysis into the plan
+    ("The photo shows ..." / "На фото изображено ..."), tier-1 sentences
+    (explicit source-image references) are removed from every section and
+    tier-2 sentences (generic photo wording) from the GLOBAL section only,
+    each with a loud warning; clean text passes through byte-identical.
   - estimate_planner_tokens() / estimate_translate_tokens(): token budgets
     (planner mode requests its own budget, independent of the max_tokens
     widget).
+  - Creative boost (fork v1.1.5/v1.1.6): normalize_creative_boost(), the built-in visual
+    motif pools (world spine + per-clip beats, deterministic per seed), the
+    CREATIVE WRITING STANDARDS system-prompt block, and expressive-level word
+    budgets — everything the fork injects to keep plans vivid and varied
+    WITHOUT breaking the LongMedia multiclip continuity rules (level 'off'
+    renders to empty strings: no creative scaffolding is injected at all).
 """
 
 from __future__ import annotations
 
 import json
 import math
+import random
 import re
 
 from . import camera_knowledge
@@ -48,6 +61,29 @@ WORD_BUDGET_MAX = 250
 # Clips at or below this length keep the contract's default "50-90 words"
 # rule; the user message only spells out explicit budgets above it.
 STANDARD_CLIP_SECONDS = 15.5
+
+# ---------------------------------------------------------------------------
+# Creative boost (fork v1.1.5)
+# ---------------------------------------------------------------------------
+# Why: the planner contract is 49 lines of rules and prohibitions and not a
+# single line asking for vivid, varied writing — instruct models answer that
+# with safe template prose ("the subject continues moving..."), identical
+# sentence patterns and the same lighting in every clip. The levels below
+# inject creative standards + per-clip motif ingredients on top of the
+# untouched contract:
+#   off        -> nothing injected, byte-identical planner prompts (v1.1.4)
+#   standard   -> CREATIVE WRITING STANDARDS block in the system prompt
+#   expressive -> standard + per-clip sampled motif hints in the user message
+#                 + a wider (still contract-compatible) word budget band
+CREATIVE_LEVELS = ("off", "standard", "expressive")
+CREATIVE_LEVEL_DEFAULT = "standard"
+
+# Expressive word budget: a denser band that still lands INSIDE the
+# contract's default "50-90 words" for standard 8-15s clips (72..84 words)
+# and keeps the 250-word cap for long clips (16x150s plans must stay within
+# the 8192-token generation budget).
+EXPRESSIVE_WORD_BUDGET_BASE = 58.0
+EXPRESSIVE_WORD_BUDGET_PER_SECOND = 1.75
 
 # Section markers of the generation contract.
 SECTION_NAMES = ("GLOBAL", "CLIPS", "CAMERAS")
@@ -588,6 +624,125 @@ def reference_images_status(images) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Photo-meta leak scrubber (v1.1.7)
+# ---------------------------------------------------------------------------
+
+# Tier 1 — explicit references to the SOURCE/attached image (EN + RU):
+# stripped in EVERY section (GLOBAL, clips, RU mirror).
+_PHOTO_META_SOURCE_RES = [re.compile(p, re.I) for p in (
+    r"\b(?:the|this|these|those)\s+(?:reference|attached|provided|given|source|input)\s+"
+    r"(?:photo(?:graph)?s?|pictures?|images?|references?)\b",
+    r"\bas\s+(?:shown|depicted|seen)\s+in\s+(?:the\s+)?(?:reference\s+)?"
+    r"(?:photo(?:graph)?|picture|image)\b",
+    r"\bin\s+(?:the\s+)?(?:reference|attached|provided|source)\s+"
+    r"(?:photo(?:graph)?|picture|image)\b",
+    r"\b(?:the|this)\s+image\s+analysis\b",
+    r"\breference\s+image\s+analysis\b",
+    # RU
+    r"\bна\s+(?:этом\s+|данном\s+)?(?:фото|фотографии|картинке|изображении|снимке)\b",
+    r"\b(?:изображён\w*|изображен\w*|видн\w*)\s+на\s+"
+    r"(?:фото|фотографии|картинке|изображении|снимке)\b",
+    r"\b(?:референсн\w*|прилагаем\w*|предоставленн\w*)\s+"
+    r"(?:изображени\w*|фото|фотографи\w*|картинк\w*|референс\w*)\b",
+)]
+
+# Tier 2 — generic photo-description wording: stripped from the GLOBAL
+# section only; inside clip bodies a photograph can be a legitimate
+# diegetic prop ("she picks up an old photograph"), so there it only
+# produces a suspect warning.
+_PHOTO_META_GENERIC_RES = [re.compile(p, re.I) for p in (
+    r"\b(?:the|this|a|an)\s+(?:photo(?:graph)?|picture|image)\s+"
+    r"(?:shows|depicts|captures|features|portrays|displays|presents)\b",
+    r"\b(?:in|on)\s+(?:the\s+)?(?:photo(?:graph)?|picture|image)\b",
+    r"\blooking\s+(?:at|into)\s+(?:the\s+)?camera\b",
+    r"\b(?:poses|posing|posed)\s+(?:for|in)\b",
+    r"\b(?:left|right)\s+(?:side|half|portion)\s+of\s+the\s+"
+    r"(?:frame|photo(?:graph)?|image|picture)\b",
+)]
+
+_LABEL_LINE_RE = re.compile(r"^\s*(?:GLOBAL:|clip_\d+:)\s*$", re.I)
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?:…])\s+")
+
+
+def _photo_meta_hit(text: str) -> bool:
+    return (any(p.search(text) for p in _PHOTO_META_SOURCE_RES)
+            or any(p.search(text) for p in _PHOTO_META_GENERIC_RES))
+
+
+def scrub_photo_meta(text: str, strict: bool = False,
+                     label: str = "clip") -> tuple[str, list[str], int]:
+    """Remove photo-description leakage from a plan section (v1.1.7).
+
+    The generation contract forbids describing the source photograph, but a
+    small instruct-VLM can still copy the reference-image analysis into the
+    plan (the user-reported "На фото изображено ... и полный вижн рефа"
+    GLOBAL). This is the deterministic backstop:
+
+      - Tier 1 (explicit source-image references, EN + RU) — whole sentences
+        removed in EVERY section (GLOBAL, clips, RU mirror).
+      - Tier 2 (generic photo wording like "the photo shows" / "in the
+        image") — whole sentences removed only when ``strict=True`` (the
+        GLOBAL section); inside clip bodies it stays with a suspect warning
+        because a photograph can be a diegetic prop there.
+
+    Label lines (``GLOBAL:`` / ``clip_N:``) and ``<Picture k>`` labels are
+    never touched. Clean input returns byte-identical text with no warnings
+    and no count, so the scrub is a no-op for compliant plans (and for every
+    canned answer without leakage — regression-safe). Returns
+    (scrubbed_text, warnings, removed_sentence_count).
+    """
+    src = str(text or "")
+    if not src.strip() or not _photo_meta_hit(src):
+        return src, [], 0
+
+    warnings: list[str] = []
+    removed: list[str] = []
+    suspects: list[str] = []
+    out_lines: list[str] = []
+
+    for line in src.split("\n"):
+        if not line.strip() or _LABEL_LINE_RE.match(line):
+            out_lines.append(line)
+            continue
+        line_t1 = any(p.search(line) for p in _PHOTO_META_SOURCE_RES)
+        line_t2 = any(p.search(line) for p in _PHOTO_META_GENERIC_RES)
+        if not line_t1 and not (line_t2 and strict):
+            if line_t2:
+                suspects.append(line.strip()[:120])
+            out_lines.append(line)
+            continue
+        kept: list[str] = []
+        line_removed = 0
+        for sent in _SENT_SPLIT_RE.split(line):
+            s_t1 = any(p.search(sent) for p in _PHOTO_META_SOURCE_RES)
+            s_t2 = any(p.search(sent) for p in _PHOTO_META_GENERIC_RES)
+            if s_t1 or (s_t2 and strict):
+                removed.append(sent.strip())
+                line_removed += 1
+            else:
+                if s_t2:
+                    suspects.append(sent.strip()[:120])
+                kept.append(sent)
+        out_lines.append(" ".join(kept) if line_removed else line)
+
+    out = "\n".join(out_lines)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip("\n")
+
+    if removed:
+        example = removed[0][:100]
+        warnings.append(
+            f"photo-meta leak scrubbed from {label} (v1.1.7): {len(removed)} sentence(s) "
+            f"removed, e.g. {example!r} — the plan must describe the video, never the "
+            "source photograph; re-seed if too much was lost")
+    if suspects:
+        warnings.append(
+            f"photo-meta suspect left in {label} (v1.1.7): photo-description wording "
+            f"({len(suspects)} hit(s), e.g. {suspects[0][:100]!r}) kept — it may be a "
+            "diegetic photograph prop; re-seed or edit the clip manually if unintended")
+    return out, warnings, len(removed)
+
+
+# ---------------------------------------------------------------------------
 # Token budgets
 # ---------------------------------------------------------------------------
 
@@ -595,30 +750,39 @@ def _round_up64(value: int) -> int:
     return int(math.ceil(max(0, value) / 64.0)) * 64
 
 
-def per_clip_word_budget(clip_seconds: float) -> int:
+def per_clip_word_budget(clip_seconds: float, creative_boost: str = "off") -> int:
     """Narrative word budget for ONE clip body, scaled with its duration.
 
     45 + 1.4*seconds, clamped to 50..250 words. An 8-15s clip lands inside
     the contract's default "50-90 words" band; a 60s clip targets ~129 words;
     a 150s clip is capped at 250 (16 such clips still fit the 8192-token
     generation budget).
+
+    creative_boost='expressive' (v1.1.5) swaps in the denser band
+    58 + 1.75*seconds (standard clips -> 72..84 words, still inside the
+    contract band; the 250-word cap is unchanged).
     """
     seconds = max(0.0, float(clip_seconds or 0.0))
-    words = WORD_BUDGET_BASE + WORD_BUDGET_PER_SECOND * seconds
+    if normalize_creative_boost(creative_boost)[0] == "expressive":
+        base, per_second = EXPRESSIVE_WORD_BUDGET_BASE, EXPRESSIVE_WORD_BUDGET_PER_SECOND
+    else:
+        base, per_second = WORD_BUDGET_BASE, WORD_BUDGET_PER_SECOND
+    words = base + per_second * seconds
     return int(min(WORD_BUDGET_MAX, max(WORD_BUDGET_MIN, round(words))))
 
 
-def estimate_planner_tokens(clip_count: int, durations=None) -> int:
+def estimate_planner_tokens(clip_count: int, durations=None, creative_boost: str = "off") -> int:
     """Token budget for the single planner generation pass.
 
     ~1.5 tokens per word of clip body + ~130 tokens per camera card + global
     + section overhead + safety margin. With `durations` given, per-clip word
     budgets scale with each clip's seconds (long clips -> longer bodies);
     without it, the historical per-clip flat estimate (~260 tokens) applies.
+    creative_boost='expressive' uses the denser word band (v1.1.5).
     """
     count = max(1, int(clip_count))
     if durations:
-        per_clip = [per_clip_word_budget(d) for d in durations[:count]
+        per_clip = [per_clip_word_budget(d, creative_boost) for d in durations[:count]
                     ] + [WORD_BUDGET_MIN] * max(0, count - len(durations))
         estimate = 360 + sum(int(w * 1.5) + 130 for w in per_clip)
     else:
@@ -631,3 +795,203 @@ def estimate_translate_tokens(text: str) -> int:
     words = len(str(text or "").split())
     estimate = int(words * 2.2) + 300
     return int(min(8192, max(1024, _round_up64(estimate))))
+
+
+# ---------------------------------------------------------------------------
+# Creative boost (fork v1.1.5)
+# ---------------------------------------------------------------------------
+
+def normalize_creative_boost(value) -> tuple:
+    """Validate a creative_boost widget value.
+
+    Returns (level, warning_or_None). Unknown / empty values fall back to
+    CREATIVE_LEVEL_DEFAULT ('standard') with a warning instead of failing the
+    run — creativity scaffolding must never break the planner pipeline.
+    """
+    text = str(value or "").strip().lower()
+    if text in CREATIVE_LEVELS:
+        return text, None
+    if not text:
+        return CREATIVE_LEVEL_DEFAULT, None
+    return (CREATIVE_LEVEL_DEFAULT,
+            f"creative_boost='{value}' is not one of {list(CREATIVE_LEVELS)}; "
+            f"falling back to '{CREATIVE_LEVEL_DEFAULT}'")
+
+
+# Built-in visual motif pools for expressive mode. STRICTLY in-world imagery:
+# no camera/framing/lens/movement vocabulary — clip bodies must stay free of
+# it, so the ingredients we hand the model must obey the same law.
+MOTIF_POOLS = {
+    "light": (
+        "hard noon light carving sharp shadows",
+        "a single practical lamp in near-darkness",
+        "backlit dust drifting in a shaft of light",
+        "neon bleeding through wet glass",
+        "overcast pearl-grey light",
+        "firelight flickering from below",
+        "cold monitor glow on skin",
+        "moonlight silvering every edge",
+        "light dying mid-scene",
+        "sun strobing through passing structures",
+    ),
+    "atmosphere": (
+        "steam coiling low over the ground",
+        "thin rain beading on every surface",
+        "dry heat shimmering the distance",
+        "snow falling in slow spirals",
+        "pollen suspended in gold light",
+        "smoke sinking like liquid",
+        "sea spray hanging in the air",
+        "dust raised by an unseen wind",
+        "condensation creeping across glass",
+        "petals falling like confetti",
+    ),
+    "texture": (
+        "cracked paint peeling in curls",
+        "oxidized copper gone green",
+        "wet asphalt mirroring the sky",
+        "raw silk catching the air",
+        "frosted glass softening every shape",
+        "grease-stained steel",
+        "velvet swallowing the light",
+        "moss reclaiming stone",
+        "chrome polished to liquid",
+        "worn leather cracked like dry earth",
+    ),
+    "color": (
+        "muted teal and amber palette",
+        "a monochrome world with one red object",
+        "bleached highlights over ink-black shadows",
+        "tungsten warmth against blue dusk",
+        "pastel haze like a faded photograph",
+        "saturated primaries dimmed by fog",
+        "sepia dust over everything",
+        "cold fluorescent light turning skin grey",
+    ),
+    "world_motion": (
+        "a sudden stillness after motion",
+        "fabric blooming in slow air",
+        "water snapping back to mirror calm",
+        "a crowd surging then parting",
+        "everything trembling at one frequency",
+        "one slow gesture inside urgent motion",
+        "objects sliding into new arrangements",
+        "ripples undoing a reflection",
+    ),
+    "story_beat": (
+        "a discovery moment",
+        "an approach that almost stops",
+        "a release of held breath",
+        "a reversal of who leads",
+        "something left behind on purpose",
+        "a repetition that differs by one detail",
+        "an ending that echoes the beginning, changed",
+        "a threshold crossed",
+    ),
+}
+
+# Deterministic motif sampling (v1.1.6) — a two-level scheme that follows
+# the LongMedia continuity law instead of fighting it:
+#   - WORLD SPINE: two ingredients sampled ONCE for the whole plan (from the
+#     light/atmosphere/texture/color pools) — the shared world state that
+#     every clip must keep present and let evolve (repo rule: the Global
+#     Prompt describes what remains constant; per-clip ingredients must not
+#     re-dress the world from scratch every clip).
+#   - PER-CLIP BEAT: one ingredient per clip (world_motion/story_beat pools)
+#     — the change this clip contributes to the ongoing scene, with a short
+#     no-repeat memory so neighbouring beats differ.
+# Same seed -> same hints (reproducible plans); different seeds -> different
+# creative directions.
+WORLD_POOLS = ("light", "atmosphere", "texture", "color")
+BEAT_POOLS = ("world_motion", "story_beat")
+
+
+def sample_motif_hints(clip_count: int, seed: int) -> dict:
+    """Sample the world spine (2 shared ingredients) + one beat per clip.
+
+    Returns {"world": (a, b), "clips": {1: (beat,), ...}} — deterministic in
+    `seed`. The spine is shared by every clip; each clip's single beat is
+    drawn from the change pools (world_motion / story_beat) so it reads as
+    development of the same scene, not a new set dressing.
+    """
+    count = max(0, int(clip_count))
+    rng = random.Random(((int(seed) & 0xFFFFFFFF) * 100003 + 7) & 0xFFFFFFFF)
+    world_pools = [MOTIF_POOLS[name] for name in WORLD_POOLS]
+    spine = tuple(rng.choice(world_pools[i % len(world_pools)]) for i in range(2))
+    beat_pools = [MOTIF_POOLS[name] for name in BEAT_POOLS]
+    clips: dict[int, tuple] = {}
+    recent: list[str] = []  # short no-repeat memory for beats
+    for i in range(1, count + 1):
+        pool = beat_pools[i % len(beat_pools)]
+        candidate = rng.choice(pool)
+        for _attempt in range(10):
+            if candidate not in recent:
+                break
+            candidate = rng.choice(pool)
+        clips[i] = (candidate,)
+        recent.append(candidate)
+        del recent[:-4]  # keep only a short memory so pools are not exhausted
+    return {"world": spine, "clips": clips}
+
+
+def render_motif_hints_block(hints) -> str:
+    """Render sampled motif hints as the user-message 'ingredients' block.
+
+    Understands the v1.1.6 shape ({"world": (..), "clips": {i: (..)}}) and
+    degrades gracefully to per-clip lines for any legacy {i: (..)} dict.
+    """
+    if isinstance(hints, dict) and "world" in hints and "clips" in hints:
+        world = "; ".join(str(h) for h in hints.get("world") or ())
+        lines = [f"world spine (present and evolving in EVERY clip): {world}"]
+        for i in sorted(hints.get("clips") or {}, key=lambda k: int(k)):
+            beat = "; ".join(str(h) for h in hints["clips"].get(i) or ())
+            lines.append(f"clip_{int(i)} beat (the change this clip contributes): {beat}")
+        return "\n".join(lines)
+    # legacy/foreign shape: plain per-clip lines
+    lines = []
+    for i in sorted((hints or {}).keys(), key=lambda k: int(k)):
+        joined = "; ".join(str(h) for h in hints[i])
+        lines.append(f"clip_{int(i)}: {joined}")
+    return "\n".join(lines)
+
+
+CREATIVE_STANDARDS_HEADER = "CREATIVE WRITING STANDARDS (fork v1.1.6)"
+
+CREATIVE_STANDARDS_TEXT = """\
+CREATIVE WRITING STANDARDS (fork v1.1.6 — applies to the GLOBAL and CLIPS prose; the output contract above always wins when they conflict):
+- CONTINUITY FIRST: the sequence is one continuous evolving scene. Every clip continues the state left by the previous clip; variety comes from WHAT happens next (new concrete events, textures, micro-details), never from resetting the world, the light or the cast. The contract's continuity verbs (continues, gradually, reaches, begins, transitions into...) are welcome — vary the sentences around them, not the law itself.
+- Pitch, don't fill in a form. Every clip carries ONE concrete, memorable visual idea — an image someone could describe to another person afterwards. If a clip reads like a template ("the subject continues moving..."), rewrite it before emitting it.
+- Specific nouns beat generic adjectives: "grease-stained overalls", "rain beading on a chrome handrail", "a moth circling the lamp" — never "interesting clothes", "nice atmosphere", "beautiful surroundings".
+- Anchor every clip physically: materials, how light behaves (hard or soft, its direction and colour), micro-events (a drip, a tremor, a glance, fabric catching air), and one sensory contrast per clip (temperature, scale, texture, stillness against motion).
+- Vary the PROSE, not the world: never open two clips with the same sentence pattern, and let the dominant imagery progress step by step — each clip advances the same evolving atmosphere one clear stage further (dusk deepens, rain thickens, the crowd grows).
+- Vary the verbs of the material world: spills, coils, snaps, drifts, blooms, fractures, surges, settles — concrete change verbs that carry the SAME scene forward.
+- Dare inside the idea: one image per plan that daily life cannot offer (a reflection showing another time, the subject doubled in glass, smoke sinking like liquid), one transformation of state (wet to dry, calm to storm, empty to crowded) developed ACROSS several clips, one moment of held tension and one of release."""
+
+CREATIVE_EXPRESSIVE_ADDENDUM = """\
+
+EXPRESSIVE MODE (in addition to the standards above):
+- Invent boldly: surreal but internally coherent imagery, sensory paradoxes, and a micro-story arc across the sequence — each clip escalates or answers the previous one (cause to effect, question to answer, tension to release). The arc is the through-line: bold images must still belong to one evolving world.
+- The suggested visual motifs in the user message are ingredients, not a checklist: the WORLD SPINE must be present and developing in every clip; each clip's beat ingredient advances the scene one stage. Weave them invisibly into the prose; never quote them verbatim, never enumerate them.
+- CAMERAS section: neighbouring cards should differ in at least two fields (shot_size, movement, rig, ...) — the framing changes while the scene continues. Exact repetition is justified only as a deliberate rhythm (a strict A-B-A pattern)."""
+
+# Injected into the EN->RU translate system prompt when creative_boost is on:
+# the translation must not flatten the freshly won vividness back to neutral
+# bureaucratic Russian.
+TRANSLATE_VIVID_NOTE = (
+    "ХУДОЖЕСТВЕННАЯ ТОЧНОСТЬ (v1.1.5+): сохрани всю образность и конкретику "
+    "оригинала — материалы, поведение света, микрособытия, смелые образы — "
+    "и связность повествования между клипами (глаголы продолжения, "
+    "наследование состояния сцены). Не выхолащивай текст до нейтрального "
+    "пересказа: яркий английский должен остаться ярким русским. Правила "
+    "сохранения разметки выше имеют абсолютный приоритет."
+)
+
+
+def render_creative_standards(level: str) -> str:
+    """The system-prompt addendum for a creative level ('' for off)."""
+    normalized, _warning = normalize_creative_boost(level)
+    if normalized == "off":
+        return ""
+    if normalized == "standard":
+        return CREATIVE_STANDARDS_TEXT
+    return CREATIVE_STANDARDS_TEXT + CREATIVE_EXPRESSIVE_ADDENDUM

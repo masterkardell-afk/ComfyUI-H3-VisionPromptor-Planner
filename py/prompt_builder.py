@@ -109,27 +109,51 @@ def load_planner_system_template() -> str:
 
 def build_planner_messages(total_duration, target_clip_duration, clip_count, clip_durations,
                            user_idea, vision_context, extra_instructions,
-                           custom_system_prompt, n_images):
+                           custom_system_prompt, n_images,
+                           style_directive="", creative_boost="off", motif_hints=None):
     """Build the (system, user) pair for the single planner generation pass.
 
     The system prompt embeds the full LongMedia Cameras vocabulary
     (camera_knowledge.render_knowledge_block) unless a custom system prompt
     is supplied — in which case it replaces the built-in planner prompt
     entirely (advanced usage).
+
+    Creative boost (fork v1.1.5/v1.1.6):
+      - style_directive: the user's own brief (genre / mood / visual style);
+        injected verbatim into the user message whenever non-empty —
+        including level 'off' (a user's explicit words must always pass).
+      - creative_boost: 'standard' appends the CREATIVE WRITING STANDARDS
+        block to the built-in system prompt (custom system prompts are left
+        untouched); 'expressive' additionally injects the world-spine motif
+        hints into the user message and widens the word budget band.
+      - 'off' + empty style_directive -> no creative scaffolding injected.
     """
     from . import camera_knowledge
+    from . import planner_mode
+
+    level, _level_warning = planner_mode.normalize_creative_boost(creative_boost)
 
     if (custom_system_prompt or "").strip():
         system = custom_system_prompt.strip()
     else:
         system = load_planner_system_template().replace(
             PLANNER_SYSTEM_PLACEHOLDER, camera_knowledge.render_knowledge_block())
+        # Creative standards ride on the BUILT-IN planner prompt only — a
+        # user-supplied custom system prompt is advanced usage and stays
+        # exactly as written.
+        standards = planner_mode.render_creative_standards(level)
+        if standards:
+            system = system + "\n\n" + standards
 
     user_parts: list[str] = []
     if vision_context and vision_context.strip():
         user_parts.append(
-            "Reference image analysis (facts about the provided picture(s); "
-            "<Picture N> refers to the Nth provided image):\n" + vision_context.strip())
+            "Reference image analysis — RAW MATERIAL for identity anchors ONLY, never "
+            "content to copy into the plan: extract solely what the user's idea asks to "
+            "take from each picture and never describe the photo itself anywhere in the "
+            "answer. <Picture N> refers to the Nth provided image (the user may also "
+            "write <image_N-1>: <image_0> == <Picture 1>, <image_1> == <Picture 2>, ...):\n"
+            + vision_context.strip())
 
     idea = (user_idea or "").strip()
     if idea:
@@ -138,31 +162,55 @@ def build_planner_messages(total_duration, target_clip_duration, clip_count, cli
         user_parts.append("User idea: (none provided — invent a coherent, concrete cinematic "
                           "sequence consistent with the reference image analysis, if any.)")
 
+    # The user's own creative brief: always passes through when non-empty,
+    # at any creative_boost level (level 'off' only disables the fork's own
+    # scaffolding, never the author's words).
+    directive = (style_directive or "").strip()
+    if directive:
+        user_parts.append(
+            "Creative direction (the author's brief — follow it closely; it may override "
+            "default stylistic choices but never the output contract):\n" + directive)
+
     durations_repr = ", ".join(f"{d:g}s" for d in clip_durations)
     user_parts.append(
         f"Constraint: the final video is {float(total_duration):g} seconds in total, delivered as "
         f"{int(clip_count)} consecutive clips with a target clip length of "
         f"{float(target_clip_duration):g}s. Planned per-clip durations: {durations_repr}. "
         f"Write exactly {int(clip_count)} clips (clip_1 .. clip_{int(clip_count)}) and exactly "
-        f"{int(clip_count)} camera cards.")
+        f"{int(clip_count)} camera cards. The clips form ONE continuous evolving scene: "
+        f"clip_1 establishes the situation and every next clip continues the state left "
+        f"by the previous clip.")
 
     # Long clips (beyond the standard ~15s range): spell out per-clip narrative
     # word budgets so the plan's density scales with each clip's duration
     # instead of the contract's default 50-90-word band.
-    from . import planner_mode
     if clip_durations and max(float(d) for d in clip_durations) > planner_mode.STANDARD_CLIP_SECONDS:
         budgets = ", ".join(
-            f"clip_{i + 1} ~{planner_mode.per_clip_word_budget(d)} words"
+            f"clip_{i + 1} ~{planner_mode.per_clip_word_budget(d, level)} words"
             for i, d in enumerate(clip_durations[:int(clip_count)]))
         user_parts.append(
             "Per-clip word budgets (long clips — scale each clip's narrative to its duration, "
             "covering the full action progression from its start to its end): " + budgets + ".")
 
+    # Expressive level: world-spine + per-clip beat ingredients, sampled by
+    # the node (deterministic in the generation seed) from the built-in motif
+    # pools. The spine is shared by every clip (LongMedia continuity law:
+    # constants live in the world state), each clip's beat is the change it
+    # contributes — variety without independent-clip drift.
+    if level == "expressive" and motif_hints:
+        user_parts.append(
+            "Suggested visual motifs — creative ingredients. The WORLD SPINE must stay "
+            "present and gradually develop in every clip; each clip's beat is the change "
+            "that clip contributes to the ongoing scene. Weave them naturally into the "
+            "prose; never quote them verbatim, never list or enumerate them:\n"
+            + planner_mode.render_motif_hints_block(motif_hints))
+
     if int(n_images) > 0:
         user_parts.append(
             f"{int(n_images)} reference picture(s) are attached to this generation; use "
             "<Picture k> labels in the clip text wherever the referenced subject or appearance "
-            "must remain visible and consistent.")
+            "must remain visible and consistent. Notation mapping: <image_0> means <Picture 1>, "
+            "<image_1> means <Picture 2>, and so on — the user's idea may use either form.")
     else:
         user_parts.append("No reference pictures are attached; do not use <Picture> labels.")
 
@@ -177,7 +225,17 @@ def build_planner_messages(total_duration, target_clip_duration, clip_count, cli
     return system, "\n\n".join(user_parts)
 
 
-def build_translate_messages(en_text):
-    """Build the (system, user) pair for the EN -> RU mirror pass."""
+def build_translate_messages(en_text, preserve_vividness=False):
+    """Build the (system, user) pair for the EN -> RU mirror pass.
+
+    preserve_vividness=True (creative_boost on, fork v1.1.5) appends the
+    artistic-accuracy note so the translation keeps the vivid sensory
+    language instead of flattening it to neutral Russian; False leaves the
+    translate system prompt byte-identical to v1.1.4.
+    """
+    from . import planner_mode
+
     system = _read_prompt_file("planner_translate.txt")
+    if preserve_vividness:
+        system = system + "\n\n" + planner_mode.TRANSLATE_VIVID_NOTE
     return system, en_text

@@ -217,7 +217,7 @@ def main():
                        "custom_system_prompt", "seed", "temperature", "top_p",
                        "top_k", "max_tokens", "variants", "use_default_template",
                        "keep_model_loaded", "emit_planner_outputs", "total_duration",
-                       "clip_duration"]
+                       "clip_duration", "creative_boost", "style_directive"]
     got_inputs = [i.id for i in s1.inputs]
     check("H3VisionPromptor input order/names", got_inputs == expected_inputs, f"got {got_inputs}")
     check("H3VisionPromptor outputs",
@@ -240,6 +240,8 @@ def main():
     emit_in = s1.inputs[17]
     total_in = s1.inputs[18]
     clipdur_in = s1.inputs[19]
+    boost_in = s1.inputs[20]
+    style_in = s1.inputs[21]
     check("emit_planner_outputs optional (renders after optionals)",
           bool(emit_in.kwargs.get("optional")) is True)
     check("total_duration optional (renders after optionals)",
@@ -248,6 +250,15 @@ def main():
           bool(clipdur_in.kwargs.get("optional")) is True
           and clipdur_in.kwargs.get("max") == 150.0
           and clipdur_in.kwargs.get("default") == 0.0)
+    check("creative_boost combo optional with the three levels (v1.1.5)",
+          bool(boost_in.kwargs.get("optional")) is True
+          and list(boost_in.kwargs.get("options"))
+          == ["off", "standard", "expressive"]
+          and boost_in.kwargs.get("default") == "standard")
+    check("style_directive optional multiline string (v1.1.5)",
+          bool(style_in.kwargs.get("optional")) is True
+          and bool(style_in.kwargs.get("multiline")) is True
+          and style_in.kwargs.get("default") == "")
     # Regression (v1.1.1): a workflow saved with the ORIGINAL node stores
     # widgets_values POSITIONALLY (16 slots). The frontend renders widgets as
     # required-inputs (list order) followed by optional-inputs (list order),
@@ -262,15 +273,19 @@ def main():
         slots.append(name)
         if name == "seed":
             slots.append("<control_after_generate slot>")
-    orig_slots = slots[:-3]  # fork adds emit/total/clip_duration at the tail
+    orig_slots = slots[:-5]  # fork adds emit/total/clip_duration/boost/style at the tail
     expect_orig = ["text_encoder", "user_idea", "task_type", "duration", "vision_mode",
                    "seed", "<control_after_generate slot>", "temperature", "top_p", "top_k",
                    "max_tokens", "variants", "use_default_template", "keep_model_loaded",
                    "extra_instructions", "custom_system_prompt"]
     check("old 16-slot widgets_values lands on same-named widgets",
           orig_slots == expect_orig, f"got {orig_slots}")
-    check("fork widget slots = original + 3 planner widgets",
-          slots == expect_orig + ["emit_planner_outputs", "total_duration", "clip_duration"],
+    check("v1.1.2 19-slot widgets_values lands on same-named widgets (prefix kept)",
+          slots[:-2] == expect_orig + ["emit_planner_outputs", "total_duration", "clip_duration"],
+          f"got {slots[:-2]}")
+    check("fork widget slots = original + 5 planner widgets",
+          slots == expect_orig + ["emit_planner_outputs", "total_duration", "clip_duration",
+                                  "creative_boost", "style_directive"],
           f"got {slots}")
     imgs_in = s1.inputs[3]
     check("images autogrow template prefix image_", imgs_in.template.kwargs.get("prefix") == "image_")
@@ -716,6 +731,270 @@ def main():
           planner_user_msg.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n")
           and planner_user_msg.startswith("<|im_start|>system\n"),
           "suppress_thinking must append the Qwen3 empty-think-block after the assistant marker")
+
+    # ------------------------------------------------------------------
+    # 11b-boost. Creative boost defaults (v1.1.5): the 11b run above used the
+    # widget defaults, i.e. creative_boost='standard' — the planner system
+    # prompt must carry the CREATIVE WRITING STANDARDS block and the RU
+    # translate pass must carry the artistic-accuracy note, out of the box.
+    # ------------------------------------------------------------------
+    check("creative default: level 'standard' in debug",
+          pdebug2["creative_boost"] == "standard"
+          and pdebug2["style_directive"] is None
+          and pdebug2["motif_hints"] is None)
+    check("creative default: planner system carries the writing standards",
+          "CREATIVE WRITING STANDARDS" in planner_user_msg
+          and "EXPRESSIVE MODE" not in planner_user_msg)
+    check("creative default: translate system carries the vividness note",
+          "ХУДОЖЕСТВЕННАЯ ТОЧНОСТЬ" in fpc2.prompts[1])
+
+    # ------------------------------------------------------------------
+    # 11f. Creative boost 'expressive' + style_directive (v1.1.5): the user
+    # message must carry the author's brief and the sampled per-clip motif
+    # ingredients; the system prompt must add the EXPRESSIVE addendum; the
+    # plan itself must still parse exactly like before (creativity must
+    # never break the output contract).
+    # ------------------------------------------------------------------
+    class FakePlannerClip3(FakePlannerClip2):
+        pass
+
+    fpc_boost = FakePlannerClip3()
+    planner_boost = nodes.H3VisionPromptor.execute(
+        text_encoder="ignored", user_idea="a ritual in a temple", task_type="Auto",
+        duration=8.0, vision_mode="skip (idea only)", seed=42, temperature=0.7,
+        top_p=0.95, top_k=64, max_tokens=256, variants=1,
+        use_default_template=False, keep_model_loaded=True,
+        clip=fpc_boost, images=None, extra_instructions="", custom_system_prompt="",
+        emit_planner_outputs=True, total_duration=60.0, clip_duration=30.0,
+        creative_boost="expressive",
+        style_directive="rain-soaked neon noir, melancholy, Wong Kar-wai colours",
+    )
+    bargs = planner_boost.args if isinstance(planner_boost, _NodeOutput) else planner_boost.result
+    bdebug = json.loads(bargs[2])
+    boost_prompt = fpc_boost.prompts[0]
+    check("creative expressive: plan still parses (2 clips of 30s)",
+          json.loads(bargs[6]) == [30.0, 30.0] and bargs[3].count("clip_") == 2
+          and bargs[4].startswith("GLOBAL:"))
+    check("creative expressive: system prompt carries standards + addendum",
+          "CREATIVE WRITING STANDARDS" in boost_prompt and "EXPRESSIVE MODE" in boost_prompt)
+    check("creative expressive: user message carries the author's brief",
+          "Creative direction" in boost_prompt
+          and "rain-soaked neon noir, melancholy, Wong Kar-wai colours" in boost_prompt)
+    check("creative expressive: motif ingredients in the user message",
+          "Suggested visual motifs" in boost_prompt and "world spine" in boost_prompt
+          and "clip_1 beat" in boost_prompt and "clip_2 beat" in boost_prompt)
+    check("creative expressive: translate pass keeps the vividness note",
+          "ХУДОЖЕСТВЕННАЯ ТОЧНОСТЬ" in fpc_boost.prompts[1])
+    check("creative expressive: debug echoes level, brief and hints",
+          bdebug["creative_boost"] == "expressive"
+          and "neon noir" in (bdebug["style_directive"] or "")
+          and isinstance(bdebug["motif_hints"], dict)
+          and set(bdebug["motif_hints"].keys()) == {"world", "clips"}
+          and len(bdebug["motif_hints"]["world"]) == 2
+          and set(bdebug["motif_hints"]["clips"].keys()) == {"1", "2"}
+          and all(len(v) == 1 for v in bdebug["motif_hints"]["clips"].values()))
+    # Determinism: same seed -> same motif ingredients across runs.
+    hints_same = nodes.planner_mode.sample_motif_hints(2, 42)
+    check("creative expressive: motif hints deterministic in the seed",
+          tuple(bdebug["motif_hints"]["world"]) == tuple(hints_same["world"])
+          and tuple(bdebug["motif_hints"]["clips"]["1"]) == tuple(hints_same["clips"][1])
+          and tuple(bdebug["motif_hints"]["clips"]["2"]) == tuple(hints_same["clips"][2]))
+
+    # ------------------------------------------------------------------
+    # 11g. Creative boost 'off' (v1.1.5 regression): byte-exact v1.1.4
+    # prompts — no standards block, no motif ingredients, no translate note,
+    # while the plan still parses.
+    # ------------------------------------------------------------------
+    class FakePlannerClip4(FakePlannerClip2):
+        pass
+
+    fpc_off = FakePlannerClip4()
+    planner_off = nodes.H3VisionPromptor.execute(
+        text_encoder="ignored", user_idea="a ritual in a temple", task_type="Auto",
+        duration=8.0, vision_mode="skip (idea only)", seed=42, temperature=0.7,
+        top_p=0.95, top_k=64, max_tokens=256, variants=1,
+        use_default_template=False, keep_model_loaded=True,
+        clip=fpc_off, images=None, extra_instructions="", custom_system_prompt="",
+        emit_planner_outputs=True, total_duration=60.0, clip_duration=30.0,
+        creative_boost="off",
+    )
+    oargs = planner_off.args if isinstance(planner_off, _NodeOutput) else planner_off.result
+    odebug = json.loads(oargs[2])
+    off_prompt = fpc_off.prompts[0]
+    check("creative off: plan still parses",
+          json.loads(oargs[6]) == [30.0, 30.0] and oargs[3].count("clip_") == 2)
+    check("creative off: no standards, no motifs, no brief anywhere",
+          "CREATIVE WRITING STANDARDS" not in off_prompt
+          and "EXPRESSIVE MODE" not in off_prompt
+          and "Suggested visual motifs" not in off_prompt
+          and "Creative direction" not in off_prompt)
+    check("creative off: translate prompt without the vividness note",
+          "ХУДОЖЕСТВЕННАЯ ТОЧНОСТЬ" not in fpc_off.prompts[1])
+    check("creative off: debug echoes the off level",
+          odebug["creative_boost"] == "off" and odebug["motif_hints"] is None
+          and odebug["style_directive"] is None)
+    # The 'off' planner chat prompt must equal the 11b 'standard' prompt with
+    # ONLY the standards block removed (byte-exact regression guard).
+    std_block = nodes.planner_mode.CREATIVE_STANDARDS_TEXT
+    check("creative off: prompt == standard prompt minus the standards block",
+          off_prompt == planner_user_msg.replace("\n\n" + std_block, ""))
+
+    # ------------------------------------------------------------------
+    # 11h. Lost GLOBAL guard (v1.1.6): when the model answer has parseable
+    # clips but NO GLOBAL section, the node must warn loudly (LongMedia joins
+    # global_prompt with every clip at runtime — an empty global turns the
+    # sequence into independent scenes), keep global_prompt empty and report
+    # global_prompt_chars=0 in the debug output.
+    # ------------------------------------------------------------------
+    PLANNER_ANSWER_NOGLOBAL = (
+        "=== CLIPS ===\n"
+        "clip_1:\n"
+        "The woman walks toward the central altar across the long ceremonial hall.\n"
+        "\n"
+        "clip_2:\n"
+        "She reaches the altar and the chamber fills with warm light.\n"
+        "\n"
+        "=== CAMERAS ===\n"
+        '[{"clip_id": "clip-1", "clip_name": "Approach", "shot_size": "Medium Shot", '
+        '"rig": "3-Axis Gimbal", "camera_body": "Cinematic Neutral", "lens": "Natural 35mm", '
+        '"stabilization": "Gimbal Smooth", "movement": "Track Forward", "speed": "Slow", '
+        '"transition_type": "Continuous / Same Shot", "space_relation": "Same Space", '
+        '"entity_continuity": "Lock Population / Layout", "transition_to_next": true}, '
+        '{"clip_id": "clip-2", "clip_name": "Arrival", "shot_size": "Wide Shot", '
+        '"rig": "Tripod / Locked Head", "camera_body": "Cinematic Neutral", '
+        '"lens": "Natural 35mm", "stabilization": "Gimbal Smooth", "movement": "Static", '
+        '"speed": "Slow", "transition_type": "Cut", "space_relation": "Same Space", '
+        '"entity_continuity": "Lock Population / Layout", "transition_to_next": false}]'
+    )
+
+    class FakePlannerClip5(FakePlannerClip2):
+        def decode(self, ids):
+            n_generate = sum(1 for c in self.calls if c[0] == "generate")
+            return PLANNER_ANSWER_NOGLOBAL if n_generate == 1 else RU_ANSWER_2
+
+    fpc_nog = FakePlannerClip5()
+    planner_nog = nodes.H3VisionPromptor.execute(
+        text_encoder="ignored", user_idea="a ritual in a temple", task_type="Auto",
+        duration=8.0, vision_mode="skip (idea only)", seed=42, temperature=0.7,
+        top_p=0.95, top_k=64, max_tokens=256, variants=1,
+        use_default_template=False, keep_model_loaded=True,
+        clip=fpc_nog, images=None, extra_instructions="", custom_system_prompt="",
+        emit_planner_outputs=True, total_duration=60.0, clip_duration=30.0,
+        creative_boost="off",
+    )
+    nargs = planner_nog.args if isinstance(planner_nog, _NodeOutput) else planner_nog.result
+    ndebug = json.loads(nargs[2])
+    check("lost global: clips still parse and planner_prompt survives",
+          nargs[3].count("clip_") == 2 and json.loads(nargs[6]) == [30.0, 30.0])
+    check("lost global: global_prompt output stays empty",
+          nargs[5] == "" and ndebug["global_prompt_chars"] == 0)
+    check("lost global: loud warning names the consequence and the wiring",
+          any("GLOBAL section is missing or empty" in w
+              and "independent scenes" in w and "global_prompt" in w
+              for w in ndebug["warnings"]))
+
+    # ------------------------------------------------------------------
+    # 11i. Reference-image photo-meta leak (v1.1.7): with a ref image
+    # connected, the vision dump must NOT be copied into GLOBAL ("The photo
+    # shows ..." -> RU mirror "На фото изображено ... и полный вижн рефа").
+    # The vision pass system prompt bans photo-artifact wording; the planner
+    # user message frames the analysis as RAW MATERIAL with the <image_0> ->
+    # <Picture 1> mapping; the deterministic scrubber removes any leaked
+    # sentences from the final EN outputs and the RU mirror.
+    # ------------------------------------------------------------------
+    VISION_ANSWER_LEAK = (
+        "A young woman in her late twenties with shoulder-length dark wavy hair, "
+        "wearing a red waterproof jacket, standing in a kitchen."
+    )
+    PLANNER_ANSWER_LEAK = (
+        "=== GLOBAL ===\n"
+        "The photo shows a young woman in her late twenties with shoulder-length "
+        "dark wavy hair, wearing a red waterproof jacket, posing in a kitchen. "
+        "The video follows this courier through a rain-soaked harbour city at dusk.\n"
+        "\n"
+        "=== CLIPS ===\n"
+        "clip_1:\n"
+        "The courier steps off the ferry into the rain, the same action continues.\n"
+        "\n"
+        "clip_2:\n"
+        "As shown in the reference image, she keeps her hood up. "
+        "She continues walking through the fish market.\n"
+        "\n"
+        "=== CAMERAS ===\n"
+        '[{"clip_id": "clip-1", "clip_name": "Ferry", "shot_size": "Medium Shot", '
+        '"rig": "3-Axis Gimbal", "camera_body": "Cinematic Neutral", "lens": "Natural 35mm", '
+        '"stabilization": "Gimbal Smooth", "movement": "Track Forward", "speed": "Slow", '
+        '"transition_type": "Continuous / Same Shot", "space_relation": "Same Space", '
+        '"entity_continuity": "Lock Population / Layout", "transition_to_next": true}, '
+        '{"clip_id": "clip-2", "clip_name": "Market", "shot_size": "Wide Shot", '
+        '"rig": "Tripod / Locked Head", "camera_body": "Cinematic Neutral", '
+        '"lens": "Natural 24mm", "stabilization": "Hard Locked", '
+        '"movement": "Locked-Off / Static", "speed": "Static", '
+        '"transition_type": "Cut", "space_relation": "Same Space", '
+        '"entity_continuity": "Lock Population / Layout", "transition_to_next": false}]'
+    )
+    RU_ANSWER_LEAK = (
+        "GLOBAL:\n"
+        "На фото изображена молодая женщина в красной куртке, она курьер в "
+        "дождливом портовом городе. Видео следует за ней.\n"
+        "\n"
+        "clip_1:\n"
+        "Курьер сходит с парома под дождём.\n"
+        "\n"
+        "clip_2:\n"
+        "Она продолжает идти через рыбный рынок."
+    )
+
+    class FakePlannerClipRef(FakePlannerClip2):
+        """Three scripted passes: vision -> planner -> translate."""
+
+        def decode(self, ids):
+            n_generate = sum(1 for c in self.calls if c[0] == "generate")
+            if n_generate == 1:
+                return VISION_ANSWER_LEAK
+            if n_generate == 2:
+                return PLANNER_ANSWER_LEAK
+            return RU_ANSWER_LEAK
+
+    fpc_ref = FakePlannerClipRef()
+    planner_ref = nodes.H3VisionPromptor.execute(
+        text_encoder="ignored", user_idea="take the face and hairstyle from <image_0>",
+        task_type="Auto", duration=8.0, vision_mode="detailed_subject_scene", seed=7,
+        temperature=0.7, top_p=0.95, top_k=64, max_tokens=256, variants=1,
+        use_default_template=False, keep_model_loaded=True,
+        clip=fpc_ref, images={"image_0": FakeImage()}, extra_instructions="",
+        custom_system_prompt="", emit_planner_outputs=True,
+        total_duration=60.0, clip_duration=30.0,
+    )
+    rargs = planner_ref.args if isinstance(planner_ref, _NodeOutput) else planner_ref.result
+    rdebug = json.loads(rargs[2])
+    check("ref leak: vision pass uses the photo-artifact-free system prompt",
+          "never refer to the photograph" in fpc_ref.prompts[0]
+          and "no framing, shot type" in fpc_ref.prompts[0])
+    planner_ref_msg = fpc_ref.prompts[1]
+    check("ref leak: planner user message frames the analysis as RAW MATERIAL",
+          "RAW MATERIAL" in planner_ref_msg
+          and "<image_0> == <Picture 1>" in planner_ref_msg
+          and VISION_ANSWER_LEAK[:40] in planner_ref_msg
+          and "Notation mapping" in planner_ref_msg)
+    check("ref leak: GLOBAL carries video constants, not the photo dump",
+          "The photo shows" not in rargs[5] and "kitchen" not in rargs[5]
+          and "posing" not in rargs[5] and "courier" in rargs[5])
+    check("ref leak: clips scrubbed of source-image references",
+          "reference image" not in rargs[3].lower()
+          and rargs[3].count("clip_") == 2
+          and "fish market" in rargs[3])
+    check("ref leak: RU mirror scrubbed of the photo opener",
+          "на фото" not in rargs[4].lower() and rargs[4].startswith("GLOBAL:")
+          and "clip_1:" in rargs[4])
+    check("ref leak: scrub warnings + debug counter",
+          rdebug["photo_meta_scrubbed"] >= 3
+          and any("photo-meta" in w for w in rdebug["warnings"]))
+    check("ref leak: reference_images_status reports the connected slot",
+          json.loads(rargs[8]) == {"images_connected": True, "count": 1,
+                                   "slots": ["image_0"]})
+    check("ref leak: plan shape survives (2 clips, 2 cards, durations)",
+          json.loads(rargs[6]) == [30.0, 30.0] and len(json.loads(rargs[7])) == 2)
 
     # ------------------------------------------------------------------
     # 11c. Degenerate planner answer (the user-reported "пустышка"): the

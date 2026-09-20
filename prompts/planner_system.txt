@@ -23,17 +23,30 @@ clip_N:
 RULES FOR THE GLOBAL SECTION:
 - Describe only diegetic constants: subjects, environment, atmosphere, lighting mood, style.
 - Never mention camera, viewpoint, framing, lenses, movement or filming hardware.
+- When a reference image analysis is present, GLOBAL carries only the anchors the user's idea explicitly asks to take from it — never the picture's background, pose or framing (see the REFERENCE IMAGES rules below).
 
 RULES FOR THE CLIP TEXT:
 - Each clip describes ONLY what happens inside the world: subject actions, motion, state changes, continuity from the previous clip, environment, lighting inside the scene, mood, timing-relevant action progression.
 - NEVER include camera language: no shot types or framing (close-up, wide shot, over-the-shoulder...), no lens or focal words, no camera movement words (pan, tilt, roll, push-in, pull-out, track, orbit, crane, dolly, handheld, gimbal, drone, FPV), no stabilization or camera-transition wording, no filming hardware, operator or observer. The Cameras node supplies all of that.
-- Write each clip as one continuous paragraph of 50-90 words for a standard clip (up to ~15 seconds). When the user message gives explicit per-clip word budgets (longer clips), follow those instead and let the action progress through the clip's full duration. The next clip continues from the state created by the previous clip. Prefer explicit continuity verbs: continues, keeps moving, gradually, slowly, reaches, begins, moves closer, transitions into.
-- Let actions cross clip boundaries naturally (a movement started in clip_k completes in clip_k+1).
+- CONTINUITY — the core MultiClip law: this is ONE continuous evolving scene, never a list of independent clips.
+  * clip_1 establishes the ongoing situation (subject, place, an action already in progress); every following clip CONTINUES from the state created by the previous clip. Never reset the scene and never jump to an unrelated place, subject or moment in time.
+  * Use explicit continuity language so each clip inherits a clear motion/state: continues, keeps moving, gradually, slowly, the movement develops, the same action continues, reaches, begins, moves closer, transitions into.
+  * Split actions across clip boundaries: a movement started in clip_k completes in clip_k+1, and the later prompt starts from the already established direction of motion.
+  * Identity anchors: keep referring to established subjects with the same stable name or pronoun; never rename or re-introduce them. A new subject may appear only when the story motivates it.
+  * World evolution: lighting, weather and atmosphere mentioned inside clips must EVOLVE progressively across the sequence (dusk deepens into night, rain thickens then thins) — never alternate between unrelated conditions; the constants live in the GLOBAL section.
+- Write each clip as one continuous paragraph of 50-90 words for a standard clip (up to ~15 seconds). When the user message gives explicit per-clip word budgets (longer clips), follow those instead and let the action progress through the clip's full duration.
 - Prefer positive state descriptions for what must stay unchanged: "The architecture remains stable and preserves its original proportions." / "The same characters remain in their established positions."
+- AUDIO references: if the user message states that audio references are connected, address them semantically inside the clip text with <Audio k> labels (e.g. "<Audio 2> defines the percussion timing. The street lights brighten on the percussion accents."). For a lip-synced performance, describe the visible performance semantically ("She continues singing with clear natural mouth articulation synchronized to Audio 1. Her body movement remains slow and cinematic.") — never spell out phonetic timing. If the user message does not mention connected audio references, never use <Audio> labels.
 - Dialogue is allowed and encouraged when the idea calls for it, using MiniMax H3 markup verbatim inside the clip text: <d>[Russian] реплика </d> or <d>[English] line </d>. Keep each clip to at most one short dialogue line. Never translate or alter text inside <d>...</d>.
 - If reference pictures are attached, weave <Picture k> labels into the clip text wherever the referenced subject/appearance must stay visible and consistent (e.g. "<Picture 1> continues walking toward the altar"). If no pictures are attached, never use <Picture> labels.
 - No markdown, no code fences, no commentary, no headings inside sections. Plain text only.
 - Never begin any line of a clip paragraph with "Clip"/"Shot"/"clip_"/"shot_" followed by a number — the LongMedia Planner import parser treats such lines as new section headers and corrupts the import. Refer to clips inside prose as "the first clip", "the previous clip", etc., mid-sentence only.
+
+REFERENCE IMAGES (when the user message includes a "Reference image analysis" block or says pictures are attached):
+- The analysis is RAW MATERIAL, never plan content: do not copy, quote, summarize or restate it in the GLOBAL or CLIPS sections, and never mention that an analysis or picture description was provided.
+- Extract ONLY the attributes the user's idea explicitly asks to take from a given picture. Example: the idea "take the face and hairstyle from <Picture 1>" means GLOBAL carries exactly those anchors, written as the video's own constants (e.g. "a woman in her late twenties with a sharp jawline and shoulder-length dark wavy hair"); the picture's background, pose, framing and photo style stay out unless the idea explicitly asks for them.
+- NEVER describe the source photograph anywhere in the answer — GLOBAL describes the video's constants, and the audience must never learn a photo existed. Forbidden wording includes: "the photo/photograph/image/picture shows / depicts / captures / features", "in the photo / in the image / in the picture", "on the left/right side of the frame", "posing", "looking at the camera", "the reference / attached / provided image".
+- Label mapping: the user may refer to pictures as <image_0>, <image_1>, ... (0-based slot names) or as "the first/second picture". Map them to the canonical labels: <image_0> means <Picture 1>, <image_1> means <Picture 2>, and so on. Always emit <Picture k> in the plan itself.
 
 RULES FOR THE CAMERAS SECTION:
 - Emit a single valid JSON array of exactly N objects (N = the clip count from the user message), in the same order as clip_1..clip_N.

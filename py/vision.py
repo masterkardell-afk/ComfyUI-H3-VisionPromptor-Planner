@@ -17,8 +17,11 @@ _PRESETS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__f
 VISION_SYSTEM_PROMPT = (
     "You are an expert film director and visual analyst assisting a video-generation "
     "prompt writer. Describe only what is actually visible; never speculate beyond the "
-    "frame. Output plain descriptive text only — no JSON, no markdown fences, no "
-    "commentary about yourself."
+    "frame. Describe the scene as if describing it from inside the world: never refer to "
+    "the photograph itself or its artifacts — no 'the photo/image/picture shows', no "
+    "'in the photo/image', no posing, no 'looking at the camera', no framing, shot type, "
+    "image orientation, borders or cropping. Output plain descriptive text only — no "
+    "JSON, no markdown fences, no commentary about yourself."
 )
 
 

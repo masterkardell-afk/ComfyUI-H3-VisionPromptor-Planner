@@ -15,6 +15,11 @@ cloud calls, no extra pip packages.
 
 <img width="1511" height="1003" alt="Screenshot 2026-08-10 062800" src="https://github.com/user-attachments/assets/ef923be7-4a10-4428-b047-5c631aa00275" />
 
+Fork version: **1.1.6**.
+
+> README for the planner fork. Russian documentation with full change
+> history lives in **README-FORK.md**.
+
 ## Features
 
 - **H3 Vision Promptor (Local VLM)** — idea (+ up to 4 images) → finished H3
@@ -31,7 +36,14 @@ cloud calls, no extra pip packages.
   `multiclip_prompt` input), `planner_prompt_ru` (Russian mirror),
   `global_prompt`, `clip_durations` (JSON), `camera_params` (JSON camera cards
   in the exact LongMedia Cameras vocabulary) and `reference_images_status`.
-  With the switch off, the node is byte-identical to the upstream original.
+  The generated plan follows the LongMedia MultiClip prompting rules
+  (v1.1.6 audit): GLOBAL = constants / clips = change, continuity verbs,
+  actions split across boundaries, positive state language, `<Audio k>`
+  semantic addressing, no camera language. Reference images contribute
+  **only the identity anchors your idea asks for** — the vision analysis is
+  raw material, never copied into the plan, with a deterministic scrubber as
+  a backstop (v1.1.7; see Troubleshooting). With the switch off, the node is
+  byte-identical to the upstream original.
 - Ships the complete H3 prompt-writer system prompt (distilled from the
   official MiniMax-H3 `h3-prompt-writing` guides) in
   `prompts/h3_system_base.txt` — hot-reloaded from disk on every run, so you
@@ -122,8 +134,10 @@ the dropdown on `<none - use CLIP input>`.
 | `emit_planner_outputs` | bool (optional) | `False` | Planner mode switch (mutually exclusive with the original outputs) |
 | `total_duration` | float (optional) | `24.0` | Planner mode: total video length, 8–2400 s (`clip_count = ceil(total / target)`, clamped to 2–16 clips) |
 | `clip_duration` | float (optional) | `0.0` | Planner mode: TARGET length of ONE clip, `0` = auto (use `duration`). 0–150 s — lets planner plans target clips **beyond the original node's 15 s single-video cap**, up to LongMedia's 150 s per-clip limit. Overrides `duration` in planner mode; ignored in the original mode |
+| `creative_boost` | combo (optional) | `standard` | Planner mode (v1.1.5, reworked v1.1.6): `off` = built-in contract only, no creative blocks; `standard` = CREATIVE WRITING STANDARDS in the system prompt, rewritten continuity-first (concrete nouns, light behavior, micro-events — variety in the prose, never in the world state); `expressive` = standard + world-spine/per-clip-beat motif ingredients + surreal imagery + denser (still contract-compatible) word budgets. Ignored in the original mode |
+| `style_directive` | string (optional, multiline) | `""` | Planner mode (v1.1.5): your creative brief — genre / mood / visual style / references — passed verbatim to the planner pass at any `creative_boost` level. Example: `rain-soaked neon noir, melancholy, Wong Kar-wai colors` |
 
-> **Widget placement (v1.1.1+).** The three planner inputs are deliberately
+> **Widget placement (v1.1.1+).** The planner inputs are deliberately
 > optional and render at the **bottom of the node panel** (after
 > `extra_instructions` / `custom_system_prompt`), not next to `duration`.
 > ComfyUI applies a saved workflow's `widgets_values` **positionally**, so the
@@ -188,6 +202,51 @@ script) until Cameras grows a text import.
 
 ## Troubleshooting
 
+- **GLOBAL starts with "The photo shows…" / RU mirror "На фото изображено…" —
+  the full vision dump of the reference image lands in the global prompt
+  (v1.1.7)** — the model was copying the reference-image analysis verbatim
+  instead of extracting the anchors your idea asked for ("take the face and
+  hairstyle from `<image_0>`"). Fixed on three levels: the contract now has
+  a REFERENCE IMAGES block (analysis = raw material; extract only the
+  requested attributes; photo-description wording forbidden; `<image_0>`
+  means `<Picture 1>`, `<image_1>` means `<Picture 2>`); the vision pass
+  itself no longer asks for framing/posing and forbids photo-artifact
+  wording; and a deterministic scrubber removes any leaked sentences from
+  GLOBAL / clips / the RU mirror (generic "photo shows" wording is stripped
+  from GLOBAL only — inside clips a photograph can be a diegetic prop, so it
+  warns instead). Check `photo_meta_scrubbed` in `debug`: `0` means the model
+  complied; if it cut too much, change the `seed` or write the idea more
+  explicitly ("from `<image_0>` take ONLY the face and hairstyle, ignore the
+  background").
+- **Clips come out as INDEPENDENT scenes, not one continuous video (v1.1.6)** —
+  three possible roots, all addressed: (1) **wiring** — the LongMedia Planner
+  imports only `clip_N:` sections from `multiclip_prompt` and joins
+  `global_prompt` with every clip at runtime, so an unwired `global_prompt`
+  input silently drops the constants (identity / environment / style) and the
+  clips render standalone. Wire `planner_prompt` → `multiclip_prompt` AND
+  `global_prompt` → `global_prompt`. (2) **contract** — the planner system
+  prompt now carries a dedicated CONTINUITY block matching the repo rules
+  (`clip_1` establishes the situation, "Never reset the scene", the full
+  repo continuity-verb list, identity anchors, progressive world evolution,
+  actions split across boundaries); the v1.1.5 creative standards previously
+  asked the model to *alternate* energy/lighting between neighbouring clips —
+  the opposite of the LongMedia guide — and have been rewritten
+  continuity-first. (3) **expressive motifs** — ingredients are now sampled
+  as a shared "world spine" (present and evolving in every clip) plus one
+  per-clip "beat", instead of two independent per-clip ingredients that
+  re-dressed the world each clip. If the model answer itself omits the
+  GLOBAL section, the node now warns loudly and reports
+  `global_prompt_chars: 0` in `debug`.
+- **Plans read template-flat / bland / no imagination (v1.1.5)** — the planner
+  contract is dozens of lines of rules with not a single line asking for vivid
+  writing, so instruct models play it safe ("the subject continues moving…",
+  same lighting in every clip). Turn `creative_boost` up to `expressive`, write
+  a `style_directive` brief, raise `temperature` to 0.6–0.8, and change the
+  seed between runs (expressive samples a world spine + per-clip beats from
+  the seed — a new seed gives a new creative direction; the ingredients are
+  visible in `debug` as `motif_hints`). `creative_boost = off` keeps the
+  built-in contract without the creative blocks; custom system prompts are
+  never modified by the boost.
 - **`The selected text encoder is a MiniMax CONDITIONING encoder …` (v1.1.4)** —
   you pointed the node at the MiniMax-H3 **text-encoder file**
   (`qwen3vl_32b_minimax_h3_*.safetensors`). That checkpoint is a Qwen3-VL-32B
