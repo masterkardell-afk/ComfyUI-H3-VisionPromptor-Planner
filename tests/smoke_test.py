@@ -693,6 +693,11 @@ def main():
           pdebug2["target_clip_duration"] == 30.0
           and pdebug2["target_clip_duration_source"] == "clip_duration"
           and pdebug2["clip_count"] == 2 and pdebug2["total_duration"] == 60.0)
+    check("planner long clips: qwen family flags in debug (v1.1.4)",
+          pdebug2["model_family"] == "qwen"
+          and pdebug2["thinking_suppressed"] is True
+          and pdebug2["chat_format"] == "chatml"
+          and "qwen" in pdebug2["family_signals"].lower())
     gen2 = [c for c in fpc2.calls if c[0] == "generate"]
     check("planner long clips: exactly two generation passes", len(gen2) == 2,
           f"got {len(gen2)}")
@@ -752,9 +757,14 @@ def main():
           "raw_planner_answer must show the un-cleaned model output")
     check("degenerate: debug flags the parse failure",
           any("no parseable clip sections" in w for w in ddebug["warnings"]))
-    check("degenerate: debug records template + thinking state",
+    check("degenerate: debug records template + honest family state (v1.1.4)",
           ddebug["use_default_template"] is True
-          and ddebug["thinking_suppressed"] is True)
+          and ddebug["model_family"] == "generic"
+          and ddebug["thinking_suppressed"] is False
+          and ddebug["chat_format"] == "raw (no chat template)")
+    check("degenerate: generic-family no-template warning present",
+          any("model_family='generic'" in w and "RAW text" in w
+              for w in ddebug["warnings"]))
     check("degenerate: no translate pass (no clips)",
           ddebug["translate_token_budget"] == 0
           and ddebug["raw_translate_answer"] is None)
@@ -777,6 +787,82 @@ def main():
     q_img = h3_engine.build_chat_text("qwen", "SYS", "USR", 2, None, suppress_thinking=True)
     check("engine: vision block preserved with suppression",
           q_img.count("<|image_pad|>") == 2 and q_img.endswith("<think>\n\n</think>\n\n"))
+
+    # ------------------------------------------------------------------
+    # 11e. MiniMax-H3 conditioning encoder rejection (v1.1.4): the H3 text
+    # encoder file (qwen3vl_32b_minimax_h3_*) routes to MiniMaxH3Tokenizer,
+    # which never chat-templates (and the checkpoint is truncated to 50
+    # layers with no final norm). The fork must fail FAST in BOTH modes with
+    # an actionable error instead of generating punctuation garbage — this
+    # is exactly the user-reported "2048 commas" scenario.
+    # ------------------------------------------------------------------
+    class _MiniMaxQwen3VL:
+        pass
+
+    class _MiniMaxH3TEModel:
+        def __init__(self):
+            self.clip_name = "qwen3vl_32b"
+            self.qwen3vl_32b = types.SimpleNamespace(transformer=_MiniMaxQwen3VL())
+
+    class _MiniMaxH3Tokenizer:
+        def __init__(self):
+            self.clip_name = "qwen3vl_32b"
+            self.qwen3vl_32b = type("MiniMaxQwenSDTokenizer", (), {})()
+
+    class FakeH3EncoderClip(FakePlannerClip):
+        """Mimics comfy.sd.CLIP for the MiniMax-H3 conditioning encoder
+        (comfy.text_encoders.minimax.MiniMaxH3TEModel + MiniMaxH3Tokenizer).
+        The nested-key layout mirrors SD1ClipModel/SD1Tokenizer, where the
+        real objects hide under attributes named after clip_name."""
+
+        def __init__(self):
+            super().__init__()
+            self.cond_stage_model = _MiniMaxH3TEModel()
+            self.tokenizer = _MiniMaxH3Tokenizer()
+
+    fh3 = FakeH3EncoderClip()
+    fam_h3 = engine.detect_family(fh3)
+    check("h3 encoder: detect_family prefers 'minimax_h3' over 'qwen'",
+          fam_h3 == "minimax_h3",
+          f"got {fam_h3!r} — signals contain both 'minimax' and 'qwen' (qwen3vl_32b key)")
+    check("h3 encoder: nested-key signals collected (clip_name key + inner classes)",
+          "qwen3vl_32b" in engine.family_signals_text(fh3)
+          and "minimaxh3tokenizer" in engine.family_signals_text(fh3).lower())
+
+    raised_planner = None
+    try:
+        nodes.H3VisionPromptor.execute(
+            text_encoder="ignored", user_idea="a ritual in a temple", task_type="Auto",
+            duration=10.0, vision_mode="skip (idea only)", seed=7, temperature=0.4,
+            top_p=0.95, top_k=64, max_tokens=2048, variants=1,
+            use_default_template=True, keep_model_loaded=True,
+            clip=fh3, images=None, extra_instructions="", custom_system_prompt="",
+            emit_planner_outputs=True, total_duration=60.0, clip_duration=10.0,
+        )
+    except RuntimeError as e:
+        raised_planner = str(e)
+    check("h3 encoder: planner mode fails fast with the actionable error",
+          raised_planner is not None and "MiniMax" in raised_planner
+          and "instruct" in raised_planner and "MiniMaxH3Tokenizer" in raised_planner,
+          f"raised={raised_planner!r}")
+    check("h3 encoder: planner fail is instant (no generation burned)",
+          not any(c[0] == "generate" for c in fh3.calls),
+          "assert_chat_capable must raise before any generate() call")
+
+    raised_legacy = None
+    try:
+        nodes.H3VisionPromptor.execute(
+            text_encoder="ignored", user_idea="a ritual in a temple", task_type="Auto",
+            duration=10.0, vision_mode="skip (idea only)", seed=7, temperature=0.4,
+            top_p=0.95, top_k=64, max_tokens=2048, variants=1,
+            use_default_template=True, keep_model_loaded=True,
+            clip=fh3, images=None, extra_instructions="", custom_system_prompt="",
+        )
+    except RuntimeError as e:
+        raised_legacy = str(e)
+    check("h3 encoder: original mode also refuses the conditioning encoder",
+          raised_legacy is not None and "MiniMax" in raised_legacy,
+          f"raised={raised_legacy!r}")
 
     # ------------------------------------------------------------------
     # 12. Original mode behavior-identical to the upstream package

@@ -335,6 +335,10 @@ class H3VisionPromptor(io.ComfyNode):
             target_source = "duration"
 
         clip_obj, source_desc = engine.resolve_clip(clip, text_encoder, keep_model_loaded)
+        # Fail fast on MiniMax conditioning encoders (the H3 text-encoder
+        # file): they cannot chat-generate at all — letting them through
+        # wastes minutes on degenerate punctuation output (v1.1.4).
+        family = engine.assert_chat_capable(clip_obj)
         image_tensor = _collect_images(images)
         n_images = _n_images(image_tensor)
         task = prompt_builder.detect_task(task_type, n_images)  # informational only
@@ -342,6 +346,14 @@ class H3VisionPromptor(io.ComfyNode):
         if int(variants) != 1:
             warnings.append(f"variants={int(variants)} ignored in planner mode (forced to 1; "
                             "multiple variants would break the Planner import format)")
+
+        if family == "generic":
+            warnings.append(
+                "model_family='generic': the prompt was sent as RAW text with no chat "
+                "template — if the selected model is actually a Qwen/Gemma instruct "
+                "repack the fork failed to recognize it; check family_signals in this "
+                "debug output and report it"
+            )
 
         # --- vision pass (same stack as the original mode + thinking
         # suppression for qwen models — a Qwen3 vision pass left in thinking
@@ -454,7 +466,7 @@ class H3VisionPromptor(io.ComfyNode):
         debug = json.dumps({
             "mode": "planner",
             "clip_source": source_desc,
-            "model_family": engine.detect_family(clip_obj),
+            "model_family": family,
             "detected_task": task,
             "n_images": n_images,
             "reference_images_status": json.loads(reference_status),
@@ -469,7 +481,14 @@ class H3VisionPromptor(io.ComfyNode):
             "planner_token_budget": planner_budget,
             "translate_token_budget": translate_budget,
             "use_default_template": bool(use_default_template),
-            "thinking_suppressed": True,
+            # Honest flag (v1.1.4): the think suppressor is only APPLIED for
+            # family='qwen' (engine.build_chat_text) — report the effective
+            # state, not the requested one, so a generic-family run can no
+            # longer masquerade as suppressed in the debug output.
+            "thinking_suppressed": family == "qwen",
+            "chat_format": {"qwen": "chatml", "gemma4": "gemma4-turns",
+                            "gemma": "gemma-turns"}.get(family, "raw (no chat template)"),
+            "family_signals": engine.family_signals_text(clip_obj),
             # Raw model answers (BEFORE light_clean strips think-blocks), so a
             # degenerate generation is diagnosable from a Previewer on `debug`
             # instead of guessing from empty planner outputs.

@@ -188,6 +188,22 @@ script) until Cameras grows a text import.
 
 ## Troubleshooting
 
+- **`The selected text encoder is a MiniMax CONDITIONING encoder …` (v1.1.4)** —
+  you pointed the node at the MiniMax-H3 **text-encoder file**
+  (`qwen3vl_32b_minimax_h3_*.safetensors`). That checkpoint is a Qwen3-VL-32B
+  *truncated to 50 layers, with no final layernorm*, and ComfyUI routes it to
+  `MiniMaxH3Tokenizer`, which applies **no chat template by design** — so the
+  node used to send it raw text and it degenerated into punctuation (rows of
+  `.` or `,` — the "dots"/"empty planner outputs"/"2048 commas" reports, with
+  ~4 minutes of `planner_seconds` burned). The fork now detects this
+  (`model_family: minimax_h3`) and **fails fast in both modes** with the
+  actionable error instead of generating garbage. Keep that file for the
+  H3 video pipeline and select a **generative instruct VLM** here: Qwen3-VL
+  4B/8B Instruct (or Gemma-3/4-Vision) repacks in `models/text_encoders/`.
+  Debug output also got honest in v1.1.4: `thinking_suppressed` now reports
+  the *applied* state (qwen only), plus new `chat_format`
+  (chatml / gemma-turns / raw) and `family_signals` fields, and a loud
+  warning fires for `generic`-family encoders ("prompt sent as RAW text").
 - **Empty planner outputs / "dots" instead of a prompt (Qwen3 models)** —
   Qwen3 models are reasoners: the answer starts with a thinking block, and
   ComfyUI's own qwen3vl template suppresses it by appending an **empty

@@ -89,30 +89,92 @@ def resolve_clip(clip_input, text_encoder_name: str, keep_model_loaded: bool = T
 # Model-family detection and chat templating
 # ---------------------------------------------------------------------------
 
-def detect_family(clip) -> str:
-    """Sniff the CLIP's transformer / tokenizer class names to classify the model.
+# MiniMax conditioning encoders (the H3 text encoder — files like
+# qwen3vl_32b_minimax_h3_*.safetensors — and the Music3 DAV) are routed by
+# ComfyUI to comfy.text_encoders.minimax, whose MiniMaxH3Tokenizer applies NO
+# chat template BY DESIGN ("The H3 presentation is NOT chat-templated"). The
+# checkpoint is also truncated to 50 layers with no final layernorm. Used as a
+# prompt-writing VLM they degenerate into punctuation streams (rows of '.' or
+# ','), so the fork refuses them fast with an actionable error instead of
+# burning minutes of generation on garbage (v1.1.4).
+MINIMAX_CONDITIONING_ERROR = (
+    "[H3 VisionPromptor] The selected text encoder is a MiniMax CONDITIONING encoder "
+    "(files like qwen3vl_32b_minimax_h3_*.safetensors): a Qwen3-VL-32B truncated to 50 "
+    "layers, with no final layernorm and NO chat template (ComfyUI routes it to "
+    "MiniMaxH3Tokenizer, which tokenizes raw text only — so no chat format, and the "
+    "planner think-suppressor can never engage). It cannot write prompts: asked to "
+    "generate, it degenerates into punctuation (rows of '.' or ','), which is exactly "
+    "what the previous empty/garbage runs showed. Keep that file for the MiniMax-H3 "
+    "video pipeline itself and point this node at a GENERATIVE instruct VLM instead: "
+    "Qwen3-VL 4B/8B Instruct (or Gemma-3/4-Vision) instruct repacks placed in "
+    "models/text_encoders/. After the swap the qwen chat template (and planner-mode "
+    "think suppression) engage automatically."
+)
 
-    Returns "qwen" | "gemma4" | "gemma" | "generic" (case-insensitive matching).
-    "gemma4" is checked before "gemma" because Gemma-4 class names also contain
-    the substring "gemma".
+
+def _family_signals(clip) -> list[str]:
+    """Collect class-name / key-name signals used to classify the text encoder.
+
+    All probes are defensive and optional. Beyond the original class-name
+    sniffing this now also walks the SD1ClipModel/SD1Tokenizer layouts used by
+    ComfyUI's generative text encoders, where the real objects are stored under
+    an attribute NAMED AFTER the key (e.g. the MiniMax-H3 TE keeps its
+    transformer at cond_stage_model.<clip_name>.transformer and its inner
+    tokenizer at tokenizer.<clip_name>) — the plain .transformer / .tokenizer
+    probes miss them (v1.1.4; this is why the H3 encoder used to sniff as
+    "generic" and get raw, un-templated prompts).
     """
     names: list[str] = []
     try:
-        transformer = getattr(getattr(clip, "cond_stage_model", None), "transformer", None)
-        if transformer is not None:
-            names.append(type(transformer).__name__)
+        csm = getattr(clip, "cond_stage_model", None)
+        if csm is not None:
+            names.append(type(csm).__name__)
+            transformer = getattr(csm, "transformer", None)
+            if transformer is not None:
+                names.append(type(transformer).__name__)
+            clip_name = getattr(csm, "clip_name", None)
+            if isinstance(clip_name, str) and clip_name:
+                names.append(clip_name)
+                nested = getattr(csm, clip_name, None)
+                if nested is not None:
+                    names.append(type(nested).__name__)
+                    nested_tr = getattr(nested, "transformer", None)
+                    if nested_tr is not None:
+                        names.append(type(nested_tr).__name__)
     except Exception:
         pass
     try:
-        tokenizer = getattr(clip, "tokenizer", None)
-        if tokenizer is not None:
-            names.append(type(tokenizer).__name__)
-            inner = getattr(tokenizer, "tokenizer", None)
+        tok = getattr(clip, "tokenizer", None)
+        if tok is not None:
+            names.append(type(tok).__name__)
+            inner = getattr(tok, "tokenizer", None)
             if inner is not None:
                 names.append(type(inner).__name__)
+            clip_name = getattr(tok, "clip_name", None)
+            if isinstance(clip_name, str) and clip_name:
+                names.append(clip_name)
+                nested = getattr(tok, clip_name, None)
+                if nested is not None:
+                    names.append(type(nested).__name__)
     except Exception:
         pass
-    haystack = " ".join(names).lower()
+    return names
+
+
+def detect_family(clip) -> str:
+    """Sniff the CLIP's transformer / tokenizer class + key names to classify the model.
+
+    Returns "minimax_h3" | "qwen" | "gemma4" | "gemma" | "generic"
+    (case-insensitive matching). "minimax" is checked FIRST: the MiniMax-H3
+    conditioning encoder is Qwen3-VL-32B-based, so its signals contain BOTH
+    "minimax" (MiniMaxH3Tokenizer / MiniMaxQwen3VL / MiniMaxH3TEModel) and
+    "qwen" (clip_name "qwen3vl_32b") — the conditioning-encoder verdict must
+    win. "gemma4" is checked before "gemma" because Gemma-4 class names also
+    contain the substring "gemma".
+    """
+    haystack = " ".join(_family_signals(clip)).lower()
+    if "minimax" in haystack:
+        return "minimax_h3"
     if "qwen" in haystack:
         return "qwen"
     if "gemma4" in haystack:
@@ -120,6 +182,25 @@ def detect_family(clip) -> str:
     if "gemma" in haystack:
         return "gemma"
     return "generic"
+
+
+def family_signals_text(clip, limit: int = 240) -> str:
+    """Joined detection signals for the debug output (capped at ``limit`` chars)."""
+    return " ".join(_family_signals(clip))[:limit]
+
+
+def assert_chat_capable(clip) -> str:
+    """Return detect_family(clip), raising for MiniMax conditioning encoders.
+
+    The H3/Music conditioning encoders physically cannot serve as prompt
+    writers (no chat template, truncated, no final norm), so failing fast with
+    an actionable message beats minutes of degenerate generation. Call this
+    once after resolve_clip(); generate_text() re-checks as defense in depth.
+    """
+    family = detect_family(clip)
+    if family == "minimax_h3":
+        raise RuntimeError(MINIMAX_CONDITIONING_ERROR)
+    return family
 
 
 def _vision_block(family: str, n_images: int) -> str:
@@ -228,6 +309,10 @@ def generate_text(clip, system: str, user: str, image_tensor=None, seed: int = 0
     """
     _assert_generatable(clip, "the resolved CLIP")
     family = detect_family(clip)
+    if family == "minimax_h3":
+        # Conditioning encoders cannot chat-generate; fail with guidance
+        # instead of producing punctuation garbage (v1.1.4).
+        raise RuntimeError(MINIMAX_CONDITIONING_ERROR)
     n_images = 0
     if image_tensor is not None:
         try:
